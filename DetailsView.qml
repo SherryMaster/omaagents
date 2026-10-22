@@ -35,8 +35,16 @@ Column {
   readonly property bool pricedProvider: A.providerPriced(provider, published)
   readonly property var days: provider ? A.daysInRange(provider.dailyUsage || [], range) : []
   readonly property var stats: A.summary(days, range, todayIso, published, pricedProvider)
-  // A date field has focus: the panel's key handler must let typing through.
-  readonly property bool editing: startField.activeFocus || endField.activeFocus
+  // The custom range's calendar; it opens whenever Custom is picked.
+  property bool calendarOpen: false
+  onPeriodKindChanged: calendarOpen = periodKind === "custom"
+  readonly property var activeDates: {
+    var out = {}
+    var source = provider ? provider.dailyUsage || [] : []
+    for (var i = 0; i < source.length; i++)
+      if (Number(source[i].messageCount || 0) > 0) out[String(source[i].date)] = true
+    return out
+  }
   readonly property var buckets: A.chartBuckets(days, range, todayIso, published, 3)
   readonly property var models: A.modelRows(A.sumUsage(days), published)
   readonly property var chartModels: {
@@ -166,37 +174,47 @@ Column {
         }
       }
 
-      // Custom: the range line becomes its own two date fields. They are
-      // fixed items, not a Repeater, so committing a date never destroys
-      // the field that holds focus.
-      Row {
+      // Custom: the range line becomes a summary that opens the calendar.
+      Rectangle {
         visible: details.range.kind === "custom"
-        anchors.fill: parent
-        spacing: Style.space(8)
-        TextField {
-          id: startField
-          width: (parent.width - parent.spacing) / 2
-          height: parent.height
-          text: details.customStart
-          inputMask: "9999-99-99"
-          foreground: details.foreground
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.verticalCenter: parent.verticalCenter
+        width: summary.implicitWidth + Style.space(20)
+        height: parent.height
+        radius: Style.cornerRadius
+        color: Qt.rgba(details.foreground.r, details.foreground.g, details.foreground.b,
+          summaryArea.containsMouse || details.calendarOpen ? 0.10 : 0.05)
+        border.color: Qt.rgba(details.foreground.r, details.foreground.g, details.foreground.b, 0.25)
+        Text {
+          id: summary
+          anchors.centerIn: parent
+          text: (details.customStart !== "" ? details.range.label : "Pick dates") + (details.calendarOpen ? "  ▴" : "  ▾")
+          color: details.foreground
           font.family: details.fontFamily
-          font.pixelSize: Style.font.caption
-          verticalPadding: 0
-          onEditingFinished: details.customChanged(text, details.customEnd)
+          font.pixelSize: Style.font.bodySmall
         }
-        TextField {
-          id: endField
-          width: (parent.width - parent.spacing) / 2
-          height: parent.height
-          text: details.customEnd
-          inputMask: "9999-99-99"
-          foreground: details.foreground
-          font.family: details.fontFamily
-          font.pixelSize: Style.font.caption
-          verticalPadding: 0
-          onEditingFinished: details.customChanged(details.customStart, text)
+        MouseArea {
+          id: summaryArea
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: details.calendarOpen = !details.calendarOpen
         }
+      }
+    }
+
+    RangeCalendar {
+      visible: details.range.kind === "custom" && details.calendarOpen
+      width: parent.width
+      start: details.customStart
+      end: details.customEnd
+      todayIso: details.todayIso
+      activeDates: details.activeDates
+      foreground: details.foreground
+      fontFamily: details.fontFamily
+      onPicked: function(start, end) {
+        details.customChanged(start, end)
+        details.calendarOpen = false
       }
     }
   }

@@ -59,8 +59,10 @@ everything deeper is one step away.
 
 - **Period** — one row: `Today · 7D · 30D · Cycle · All · …`. The line below
   shows the range with `‹ ›` to step back and forward by the period's own
-  length (a day, 7 or 30 days, or a billing cycle). `…` is a custom range: the
-  range line turns into two date fields. Cycle appears when a renewal date is
+  length (a day, 7 or 30 days, or a billing cycle). `…` is a custom range: it opens a
+  calendar — click the first day, then the last (the range previews as you
+  hover), or use This month / Last month / This year. Days with usage carry a
+  dot, and the scroll wheel flips months. Click the range summary to reopen it. Cycle appears when a renewal date is
   known.
 - **Four figures** — cost, tokens (with active days), daily average per active
   day (with a projection to renewal for the current cycle, otherwise the peak

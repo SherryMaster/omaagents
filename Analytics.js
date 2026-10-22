@@ -562,3 +562,32 @@ function planLine(p, nowMs) {
   if (hours >= 1) return label + " · renews in " + hours + "h"
   return label + " · renews in " + Math.max(1, Math.floor(left / 60000)) + "m"
 }
+
+// ----------------------------------------------------------------- calendar
+
+// Six weeks of cells for a month (0-based month), starting on weekStart
+// (0 or 7 = Sunday, 1 = Monday, …), so the grid keeps one height.
+function monthGrid(year, month, weekStart, todayIso) {
+  var first = Math.round(Date.UTC(year, month, 1) / 86400000)
+  var dow = new Date(first * 86400000).getUTCDay()
+  var lead = (dow - (num(weekStart) % 7) + 7) % 7
+  var cells = []
+  for (var i = 0; i < 42; i++) {
+    var n = first - lead + i
+    var iso = isoFromNumber(n)
+    cells.push({ iso: iso, day: +iso.slice(8, 10), inMonth: +iso.slice(5, 7) === month + 1,
+      isToday: iso === todayIso, future: iso > todayIso })
+  }
+  return cells
+}
+
+// Calendar presets for the custom range, never reaching past today.
+function monthPreset(kind, todayIso) {
+  var monthStart = todayIso.slice(0, 8) + "01"
+  if (kind === "lastMonth") {
+    var start = addMonths(monthStart, -1)
+    return { start: start, end: addDays(monthStart, -1) }
+  }
+  if (kind === "thisYear") return { start: todayIso.slice(0, 5) + "01-01", end: todayIso }
+  return { start: monthStart, end: todayIso }
+}

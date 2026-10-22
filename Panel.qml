@@ -246,7 +246,6 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.page === "details" && details.editing
 
       onMoveRequested: function(dx, dy) {
         if (dx !== 0) root.page === "glance" ? root.selectProvider(root.providerIndex + dx) : root.stepPeriod(dx)

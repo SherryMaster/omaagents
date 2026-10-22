@@ -178,3 +178,24 @@ test("chartBuckets reports its unit even when the first bucket is one day", () =
   const days = A.chartBuckets([], A.periodRange("7d", 0, "2026-10-22", "", "", ""), "2026-10-22", {}, 3)
   assert.equal(days[0].unit, "day")
 })
+
+test("monthGrid lays out six weeks from the week start", () => {
+  const cells = A.monthGrid(2026, 9, 1, "2026-10-22")  // October 2026, Monday first
+  assert.equal(cells.length, 42)
+  assert.equal(cells[0].iso, "2026-09-28")  // Oct 1 2026 is a Thursday
+  assert.equal(cells[0].inMonth, false)
+  assert.equal(cells[3].iso, "2026-10-01")
+  assert.equal(cells[3].inMonth, true)
+  const today = cells.find(c => c.iso === "2026-10-22")
+  assert.equal(today.isToday, true)
+  assert.equal(cells.find(c => c.iso === "2026-10-23").future, true)
+  assert.equal(A.monthGrid(2026, 9, 0, "2026-10-22")[0].iso, "2026-09-27")  // Sunday first
+  assert.equal(A.monthGrid(2026, 9, 7, "2026-10-22")[0].iso, "2026-09-27")  // Qt's Sunday = 7
+})
+
+test("monthPreset gives calendar ranges clipped to today", () => {
+  assert.deepEqual(A.monthPreset("thisMonth", "2026-10-22"), { start: "2026-10-01", end: "2026-10-22" })
+  assert.deepEqual(A.monthPreset("lastMonth", "2026-10-22"), { start: "2026-09-01", end: "2026-09-30" })
+  assert.deepEqual(A.monthPreset("thisYear", "2026-10-22"), { start: "2026-01-01", end: "2026-10-22" })
+  assert.deepEqual(A.monthPreset("lastMonth", "2026-01-15"), { start: "2025-12-01", end: "2025-12-31" })
+})

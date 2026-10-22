@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs"
 const NAMES = ["pricing", "bucketCost", "periodRange", "daysInRange", "sumUsage", "summary",
   "chartBuckets", "modelRows", "sessionRows", "formatTokens", "formatMoney",
   "limitWindows", "paceFor", "limitDetail", "formatDuration", "planLine",
-  "resolvePeriod", "providerPriced"]
+  "resolvePeriod", "providerPriced", "monthGrid", "monthPreset"]
 
 export function loadAnalytics() {
   const source = readFileSync(new URL("../Analytics.js", import.meta.url), "utf8")
