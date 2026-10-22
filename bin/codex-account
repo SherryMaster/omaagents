@@ -1,0 +1,31 @@
+#!/usr/bin/python3
+"""Label a Codex usage record with the signed-in account's email.
+
+Decodes only the public claims segment of the locally stored ChatGPT id
+token; nothing is sent anywhere and nothing but the email leaves the file.
+"""
+
+import base64
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def account_email():
+  home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+  try:
+    token = json.loads((home / "auth.json").read_text())["tokens"]["id_token"]
+    claims = token.split(".")[1]
+    claims += "=" * (-len(claims) % 4)
+    return str(json.loads(base64.urlsafe_b64decode(claims)).get("email") or "")
+  except Exception:
+    return ""
+
+
+record = json.load(sys.stdin)
+email = account_email()
+if email:
+  record["accountLabel"] = email
+json.dump(record, sys.stdout, separators=(",", ":"))
+sys.stdout.write("\n")

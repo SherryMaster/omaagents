@@ -314,6 +314,8 @@ Item {
       limits: Array.isArray(record.limits) ? record.limits : [],
       tierLabel: String(record.tierLabel || ""),
       subscriptionEndsAt: String(record.subscriptionEndsAt || ""),
+      // Local only: the email never travels in synced snapshots.
+      accountLabel: String(record.accountLabel || ""),
       balance: balanceValue(record.balance),
 
       todayPrompts: synced ? numberValue(stats.todayPrompts) : numberValue(record.todayPrompts),

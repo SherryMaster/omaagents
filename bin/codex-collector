@@ -100,4 +100,4 @@ for old, new in replacements:
     raise SystemExit("codex-collector: packaged collector changed; patch anchor missing")
   source = source.replace(old, new, 1)
 sys.stdout.write(source)
-' | /usr/bin/python3 - "$@" | "${BASH_SOURCE[0]%/*}/codex-session-enricher" "$@"
+' | /usr/bin/python3 - "$@" | "${BASH_SOURCE[0]%/*}/codex-session-enricher" "$@" | "${BASH_SOURCE[0]%/*}/codex-account"

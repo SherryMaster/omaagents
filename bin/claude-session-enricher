@@ -270,19 +270,24 @@ def add_months(moment, months):
   return moment.replace(year=year, month=month, day=min(moment.day, days))
 
 
-def subscription_ends_at():
-  """Next renewal of a paid Claude plan, from the account Claude Code caches.
+def read_account():
+  """The signed-in account Claude Code caches beside its settings."""
+  config = os.environ.get("CLAUDE_CONFIG_DIR")
+  path = Path(config).expanduser() / ".claude.json" if config else Path.home() / ".claude.json"
+  try:
+    account = json.loads(path.read_text()).get("oauthAccount")
+  except (OSError, ValueError, AttributeError):
+    return {}
+  return account if isinstance(account, dict) else {}
+
+
+def subscription_ends_at(account):
+  """Next renewal of a paid Claude plan.
 
   Claude Code stores when the subscription began but not its renewal date, so
   this assumes monthly billing anchored on the start date — the same anchor
   Stripe uses.
   """
-  config = os.environ.get("CLAUDE_CONFIG_DIR")
-  path = Path(config).expanduser() / ".claude.json" if config else Path.home() / ".claude.json"
-  try:
-    account = json.loads(path.read_text()).get("oauthAccount") or {}
-  except (OSError, ValueError, AttributeError):
-    return ""
   if "subscription" not in str(account.get("billingType") or ""):
     return ""
   started = timestamp(account.get("subscriptionCreatedAt"), 0)
@@ -300,8 +305,11 @@ def subscription_ends_at():
 
 record = json.load(sys.stdin)
 record = enrich(record)
-ends_at = subscription_ends_at()
+account = read_account()
+ends_at = subscription_ends_at(account)
 if ends_at:
   record["subscriptionEndsAt"] = ends_at
+if account.get("emailAddress"):
+  record["accountLabel"] = str(account["emailAddress"])
 json.dump(record, sys.stdout, separators=(",", ":"))
 sys.stdout.write("\n")
