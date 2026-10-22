@@ -450,3 +450,95 @@ function formatMoney(n) {
   if (n >= 1000) return "$" + Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",")
   return "$" + n.toFixed(2)
 }
+
+// ------------------------------------------------------------------- limits
+//
+// Collectors spell windows differently ("Session (5-hour)", "5h window",
+// "Weekly (7-day)"); everything lands on {title, percent, resetAt, spanMs}.
+
+function windowIsLong(text) {
+  return text.indexOf("week") >= 0 || text.indexOf("7-day") >= 0 || text.indexOf("seven") >= 0
+    || text.indexOf("month") >= 0 || text.indexOf("30-day") >= 0
+}
+
+function windowSpanMs(label) {
+  var text = String(label || "").toLowerCase()
+  if (text.indexOf("month") >= 0 || text.indexOf("30-day") >= 0) return 30 * 86400000
+  if (windowIsLong(text)) return 7 * 86400000
+  var hours = text.match(/(\d+)\s*-?\s*h(?:our)?\b/)
+  if (hours) return Number(hours[1]) * 3600000
+  var minutes = text.match(/(\d+)\s*-?\s*m(?:in(?:ute)?s?)?\b/)
+  if (minutes) return Number(minutes[1]) * 60000
+  return 0
+}
+
+function windowTitle(label) {
+  var text = String(label || "").toLowerCase()
+  if (text.indexOf("month") >= 0) return "Monthly"
+  if (windowIsLong(text)) return "Weekly"
+  if (text.indexOf("session") >= 0 || windowSpanMs(label) > 0) return "Session"
+  var plain = String(label || "").replace(/\s*\(.*\)\s*/, "").trim()
+  return plain === "" ? "Limit" : plain
+}
+
+function limitWindows(p) {
+  var out = []
+  var list = (p && p.limits) || []
+  for (var i = 0; i < list.length; i++) {
+    var entry = list[i] || {}
+    if (entry.percent === null || entry.percent === undefined) continue
+    var percent = Number(entry.percent)
+    if (!isFinite(percent) || percent < 0) continue
+    // A collector that names the window (a model-scoped limit) beats parsing.
+    out.push({ title: String(entry.title || "") !== "" ? String(entry.title) : windowTitle(entry.label),
+      percent: percent, resetAt: String(entry.resetsAt || ""), spanMs: windowSpanMs(entry.label) })
+  }
+  return out
+}
+
+function resetMs(w, nowMs) {
+  if (!w || w.resetAt === "") return -1
+  var at = new Date(w.resetAt).getTime()
+  return isFinite(at) ? at - nowMs : -1
+}
+
+function paceFor(w, nowMs) {
+  var remaining = resetMs(w, nowMs)
+  if (!w || !(w.spanMs > 0) || remaining < 0) return -1
+  return Math.max(0, Math.min(1, 1 - remaining / w.spanMs))
+}
+
+function formatDuration(ms) {
+  if (!(ms > 0)) return "now"
+  var minutes = Math.floor(ms / 60000), hours = Math.floor(minutes / 60), days = Math.floor(hours / 24)
+  if (days > 0) return days + "d " + (hours % 24) + "h"
+  if (hours > 0) return hours + "h " + (minutes % 60) + "m"
+  return Math.max(1, minutes) + "m"
+}
+
+function limitDetail(w, nowMs) {
+  var remaining = resetMs(w, nowMs)
+  if (!(remaining > 0)) return ""
+  var text = "Resets in " + formatDuration(remaining)
+  var pace = paceFor(w, nowMs)
+  if (pace < 0) return text
+  var delta = Math.round((w.percent - pace) * 100)
+  if (Math.abs(delta) < 3) return text + " · on pace"
+  return text + " · " + Math.abs(delta) + "% " + (delta > 0 ? "ahead of pace" : "under pace")
+}
+
+// "Pro · renews in 30 days", or the collector's status when something is wrong.
+function planLine(p, nowMs) {
+  if (!p) return ""
+  if (String(p.usageStatusText || "") !== "") return String(p.usageStatusText)
+  var tier = String(p.tierLabel || "")
+  var label = tier === "" ? "Subscription" : tier.charAt(0).toUpperCase() + tier.slice(1)
+  var end = new Date(String(p.subscriptionEndsAt || "")).getTime()
+  if (!isFinite(end) || end <= nowMs) return label
+  var left = end - nowMs
+  var days = Math.floor(left / 86400000)
+  if (days >= 1) return label + " · renews in " + days + (days === 1 ? " day" : " days")
+  var hours = Math.floor(left / 3600000)
+  if (hours >= 1) return label + " · renews in " + hours + "h"
+  return label + " · renews in " + Math.max(1, Math.floor(left / 60000)) + "m"
+}

@@ -135,3 +135,20 @@ test("formatting", () => {
   assert.equal(A.formatTokens(40_000), "40K")
   assert.equal(A.formatTokens(980), "980")
 })
+
+test("limit windows, pace and header line", () => {
+  const now = Date.parse("2026-10-22T12:00:00Z")
+  const windows = A.limitWindows({ limits: [
+    { label: "Session (5-hour)", percent: 0.3, resetsAt: "2026-10-22T14:30:00Z" },
+    { label: "Weekly (7-day)", percent: 0.02, resetsAt: "2026-10-29T00:00:00Z" },
+    { label: "Broken", percent: null },
+  ] })
+  assert.equal(windows.length, 2)
+  assert.equal(windows[0].title, "Session")
+  assert.equal(windows[1].title, "Weekly")
+  close(A.paceFor(windows[0], now), 0.5)
+  assert.equal(A.limitDetail(windows[0], now), "Resets in 2h 30m · 20% under pace")
+  assert.equal(A.formatDuration(3 * 86400000 + 3600000), "3d 1h")
+  assert.equal(A.planLine({ tierLabel: "pro", subscriptionEndsAt: "2026-11-22T00:00:00Z" }, now), "Pro · renews in 30 days")
+  assert.equal(A.planLine({ tierLabel: "", usageStatusText: "Sign-in expired" }, now), "Sign-in expired")
+})
