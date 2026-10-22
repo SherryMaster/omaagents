@@ -1,0 +1,103 @@
+#!/bin/bash
+set -o pipefail
+
+# Reuse Omarchy's collector while applying the two user-plugin extensions we
+# need: Codex 0.149's approval-policy spelling and per-day token buckets for
+# accurate daily cost calculation. Exact source anchors make upstream drift
+# fail loudly instead of silently returning incomplete accounting data.
+/usr/bin/env PLUGIN_DIR="${BASH_SOURCE[0]%/*}" /usr/bin/python3 -c '
+from pathlib import Path
+import os
+import sys
+
+source = Path("/usr/share/omarchy/bin/omarchy-agent-usage-codex").read_text()
+replacements = [
+  (
+    "SCAN_REUSE_SECONDS = 20",
+    "SCAN_REUSE_SECONDS = 3",
+  ),
+  (
+    "import argparse\n",
+    "import argparse\nimport base64\n",
+  ),
+  (
+    "[codex, \"-s\", \"read-only\", \"-a\", \"on-request\", \"app-server\"]",
+    "[codex, \"-s\", \"read-only\", \"-a\", \"never\", \"app-server\"]",
+  ),
+  (
+    "recent = {day: {\"date\": day, \"messageCount\": 0} for day in recent_dates}",
+    "recent = {day: {\"date\": day, \"messageCount\": 0, \"modelUsage\": {}} for day in recent_dates}\n"
+    "daily_usage = {}",
+  ),
+  (
+    "  cutoff = time.time() - 30 * 24 * 60 * 60\n  for root in roots:",
+    "  cutoff = 0\n  for root in roots:",
+  ),
+  (
+    "  if day in recent:\n    recent[day][\"messageCount\"] += total\n",
+    "  if day in recent:\n"
+    "    recent[day][\"messageCount\"] += total\n"
+    "    day_bucket = recent[day][\"modelUsage\"].setdefault(model, {\n"
+    "      \"inputTokens\": 0, \"outputTokens\": 0,\n"
+    "      \"cacheReadInputTokens\": 0, \"cacheCreationInputTokens\": 0,\n"
+    "    })\n"
+    "    day_bucket[\"inputTokens\"] += input_tokens\n"
+    "    day_bucket[\"outputTokens\"] += output_tokens\n"
+    "    day_bucket[\"cacheReadInputTokens\"] += cache_read\n"
+    "    day_bucket[\"cacheCreationInputTokens\"] += cache_write\n",
+  ),
+  (
+    "  if day == today:\n",
+    "  history = daily_usage.setdefault(day, {\"date\": day, \"messageCount\": 0, \"modelUsage\": {}})\n"
+    "  history[\"messageCount\"] += total\n"
+    "  history_bucket = history[\"modelUsage\"].setdefault(model, {\n"
+    "    \"inputTokens\": 0, \"outputTokens\": 0,\n"
+    "    \"cacheReadInputTokens\": 0, \"cacheCreationInputTokens\": 0,\n"
+    "  })\n"
+    "  history_bucket[\"inputTokens\"] += input_tokens\n"
+    "  history_bucket[\"outputTokens\"] += output_tokens\n"
+    "  history_bucket[\"cacheReadInputTokens\"] += cache_read\n"
+    "  history_bucket[\"cacheCreationInputTokens\"] += cache_write\n\n"
+    "  if day == today:\n",
+  ),
+  (
+    "    \"recentDays\": [recent[day] for day in recent_dates],\n",
+    "    \"recentDays\": [recent[day] for day in recent_dates],\n"
+    "    \"dailyUsage\": [daily_usage[day] for day in sorted(daily_usage)],\n",
+  ),
+  (
+    "if not all(key in stats for key in (\"todayPrompts\", \"todayTotalTokens\", \"recentDays\", \"activeDates\", \"modelUsage\")):",
+    "if not all(key in stats for key in (\"todayPrompts\", \"todayTotalTokens\", \"recentDays\", \"dailyUsage\", \"activeDates\", \"modelUsage\")):",
+  ),
+  (
+    "  result = {\"limits\": [], \"tierLabel\": \"\", \"usageStatusText\": \"\", \"authHelpText\": AUTH_HELP}\n",
+    "  result = {\"limits\": [], \"tierLabel\": \"\", \"subscriptionEndsAt\": subscription_ends_at(), "
+    "\"usageStatusText\": \"\", \"authHelpText\": AUTH_HELP}\n",
+  ),
+  (
+    "def fetch_codex_rpc():\n",
+    (Path(os.environ["PLUGIN_DIR"]) / "codex-subscription.pyfrag").read_text() + "\n\ndef fetch_codex_rpc():\n",
+  ),
+  (
+    "def cache_root():\n",
+    (Path(os.environ["PLUGIN_DIR"]) / "codex-incremental.pyfrag").read_text() + "\n\ndef cache_root():\n",
+  ),
+  (
+    "  args = parser.parse_args()\n",
+    "  parser.add_argument(\"--local-only\", action=\"store_true\")\n"
+    "  args = parser.parse_args()\n"
+    "  global SCAN_FORCE\n"
+    "  SCAN_FORCE = args.force\n",
+  ),
+  (
+    "  rpc = fetch_codex_rpc()\n",
+    "  rpc = cached_codex_rpc() if args.local_only else fetch_codex_rpc()\n"
+    "  rpc[\"subscriptionEndsAt\"] = subscription_ends_at(fetch=not args.local_only)\n",
+  ),
+]
+for old, new in replacements:
+  if old not in source:
+    raise SystemExit("codex-collector: packaged collector changed; patch anchor missing")
+  source = source.replace(old, new, 1)
+sys.stdout.write(source)
+' | /usr/bin/python3 - "$@" | "${BASH_SOURCE[0]%/*}/codex-session-enricher" "$@"

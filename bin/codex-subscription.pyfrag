@@ -1,0 +1,69 @@
+# Subscription dates belong to the live account entitlement, not the ID
+# token: its billing claims can lag behind multiple successful renewals.
+def subscription_ends_at(fetch=False):
+  import urllib.request
+  auth_path = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "auth.json"
+  try:
+    tokens = json.loads(auth_path.read_text()).get("tokens") or {}
+    account_id = tokens.get("account_id") or ""
+  except (OSError, ValueError, TypeError):
+    return ""
+  cache_path = cache_root() / "codex-subscription-v1.json"
+  try:
+    cached = json.loads(cache_path.read_text())
+    if cached.get("accountId") != account_id:
+      cached = {}
+  except (OSError, ValueError, TypeError):
+    cached = {}
+
+  def future_date(value):
+    try:
+      date = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+      if date.tzinfo is None:
+        return ""
+      return date.astimezone(timezone.utc).isoformat() if date.timestamp() > time.time() else ""
+    except (ValueError, TypeError):
+      return ""
+
+  if fetch and tokens.get("access_token") and account_id:
+    try:
+      request = urllib.request.Request(
+        "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+        headers={"Authorization": "Bearer " + tokens["access_token"],
+                 "ChatGPT-Account-Id": account_id,
+                 "User-Agent": "codex_cli_rs/0.159.2"},
+      )
+      with urllib.request.urlopen(request, timeout=8) as response:
+        accounts = json.load(response).get("accounts") or {}
+      account = accounts.get(account_id)
+      if not isinstance(account, dict):
+        # Never silently substitute another account's subscription.
+        raise ValueError("Selected account not returned")
+      entitlement = account.get("entitlement") or {}
+      subscription = account.get("last_active_subscription") or {}
+      value = ""
+      if entitlement.get("has_active_subscription"):
+        if subscription.get("will_renew"):
+          value = entitlement.get("renews_at") or entitlement.get("expires_at")
+        else:
+          value = entitlement.get("expires_at") or entitlement.get("renews_at")
+      cached = {"accountId": account_id, "subscriptionEndsAt": future_date(value),
+                "checkedAt": datetime.now(timezone.utc).isoformat()}
+      write_json(cache_path, cached)
+      return cached["subscriptionEndsAt"]
+    except Exception:
+      # An offline refresh keeps a still-valid date. Never advance the billing
+      # period by arithmetic or resurrect a date the server says is inactive.
+      pass
+  value = future_date(cached.get("subscriptionEndsAt"))
+  if value or cached:
+    return value
+  # Fresh claims can provide a first-run fallback until the account is fetched.
+  try:
+    payload = tokens.get("id_token", "").split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    namespace = claims.get("https://api.openai.com/auth") or {}
+    return future_date(namespace.get("chatgpt_subscription_active_until") or
+                       claims.get("https://api.openai.com/auth.chatgpt_subscription_active_until"))
+  except Exception:
+    return ""

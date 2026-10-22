@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Cache published Standard text-token prices from OpenAI's pricing page."""
+
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.request
+from html.parser import HTMLParser
+from pathlib import Path
+
+
+URL = "https://developers.openai.com/api/docs/pricing"
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy/agents"
+DEST = STATE / "api-pricing.json"
+ATTEMPT = STATE / ".api-pricing-attempt"
+INTERVAL = 24 * 60 * 60
+MODEL_ID = re.compile(r"[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*")
+
+
+class PricingIslands(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.rows = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "astro-island":
+            return
+        props = dict(attrs).get("props", "")
+        if '"tier"' not in props or '"rows"' not in props:
+            return
+        try:
+            data = json.loads(props)
+            if data.get("tier") == [0, "standard"]:
+                self.rows = data["rows"][1]
+        except (ValueError, KeyError, IndexError, TypeError):
+            pass
+
+
+def parse_prices(page):
+    parser = PricingIslands()
+    parser.feed(page)
+    if not parser.rows:
+        raise ValueError("Standard pricing table not found")
+    prices = {}
+    for row in parser.rows:
+        try:
+            cells = [cell[1] for cell in row[1]]
+            if len(cells) != 5 or not isinstance(cells[0], str):
+                continue
+            model = cells[0].lower()
+            if not MODEL_ID.fullmatch(model):
+                continue
+            rates = cells[1:]
+            if any(not isinstance(rate, (int, float)) or isinstance(rate, bool) or rate < 0 for rate in rates):
+                continue
+            prices[model] = dict(zip(("input", "cached", "cacheWrite", "output"), rates))
+        except (IndexError, TypeError):
+            continue
+    # A changed site format must not silently replace a valid cache with junk.
+    if not all(model in prices for model in ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna")):
+        raise ValueError("Standard pricing table is incomplete")
+    return prices
+
+
+def main():
+    STATE.mkdir(parents=True, exist_ok=True)
+    force = "--force" in sys.argv[1:]
+    if not force and ATTEMPT.exists() and time.time() - ATTEMPT.stat().st_mtime < INTERVAL:
+        return
+    ATTEMPT.touch()
+    request = urllib.request.Request(URL, headers={"User-Agent": "Omarchy-Agents-Pricing/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            prices = parse_prices(response.read().decode("utf-8"))
+        payload = {"source": URL, "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "models": prices}
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=STATE, prefix=".api-pricing-", delete=False) as temp:
+            json.dump(payload, temp, separators=(",", ":"))
+            temp.write("\n")
+            name = temp.name
+        os.replace(name, DEST)
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"update-pricing: {error}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,77 @@
+#!/bin/bash
+set -o pipefail
+
+USAGE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
+PLUGIN_DIR="${BASH_SOURCE[0]%/*}"
+mkdir -p "$USAGE_DIR"
+
+flags=()
+only=()
+fast=false
+declare -A excluded
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --fast) fast=true ;;
+  --force | --limits-only) flags+=("$1") ;;
+  --except)
+    excluded[$2]=1
+    shift
+    ;;
+  *) only+=("$1") ;;
+  esac
+  shift
+done
+
+# Pricing changes once a day and only the full pass needs to check it.
+if ! $fast && (( ${#only[@]} == 0 )); then
+  python3 "$PLUGIN_DIR/update-pricing" >/dev/null 2>&1 &
+fi
+
+wanted() {
+  local agent="$1"
+  [[ -n ${excluded[$agent]} ]] && return 1
+  (( ${#only[@]} == 0 )) && return 0
+  local candidate
+  for candidate in "${only[@]}"; do
+    [[ $candidate == "$agent" ]] && return 0
+  done
+  return 1
+}
+
+collect() {
+  local collector="$1" agent="$2"
+  shift 2
+  local record tmp
+  if ! record=$("$collector" "$@") || [[ -z $record ]] || ! jq -e . >/dev/null 2>&1 <<<"$record"; then
+    echo "usage-update: $agent collector failed" >&2
+    return 1
+  fi
+  tmp=$(mktemp "$USAGE_DIR/.$agent.XXXXXX")
+  printf '%s\n' "$record" >"$tmp"
+  mv "$tmp" "$USAGE_DIR/$agent.json"
+}
+
+pids=()
+for collector in /usr/share/omarchy/bin/omarchy-agent-usage-*; do
+  [[ -x $collector ]] || continue
+  agent="${collector##*/omarchy-agent-usage-}"
+  [[ $agent == "update" ]] && continue
+  if $fast && [[ $agent != codex ]]; then continue; fi
+  wanted "$agent" || continue
+  agent_flags=("${flags[@]}")
+  if [[ $agent == codex ]]; then
+    collector="$PLUGIN_DIR/codex-collector"
+    if $fast; then agent_flags+=(--local-only); fi
+  elif [[ $agent == claude ]]; then
+    collector="$PLUGIN_DIR/claude-collector"
+  fi
+  collect "$collector" "$agent" "${agent_flags[@]}" &
+  pids+=($!)
+done
+
+status=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || status=1
+done
+exit "$status"

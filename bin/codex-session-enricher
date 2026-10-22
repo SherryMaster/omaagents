@@ -1,0 +1,236 @@
+#!/usr/bin/python3
+"""Add five interaction-sorted native Codex sessions to a usage record."""
+
+import json
+import os
+import re
+import sys
+import sqlite3
+import time
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def number(value):
+  try:
+    return int(value or 0)
+  except Exception:
+    return 0
+
+
+def timestamp(value, fallback):
+  if isinstance(value, (int, float)):
+    return value / 1000 if value > 10_000_000_000 else value
+  try:
+    text = str(value or "")
+    return datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text).timestamp()
+  except Exception:
+    return fallback
+
+
+def title_text(value):
+  text = str(value or "").strip()
+  if not text or text.startswith(("<recommended_plugins>", "<environment_context>",
+                                  "# AGENTS.md instructions", "<permissions instructions>")):
+    return ""
+  text = re.sub(r"\[Attached image[^\]]*\]", "", text)
+  text = re.sub(r"<[^>]+>", " ", text)
+  text = re.sub(r"\s+", " ", text).strip()
+  if not text:
+    return ""
+  return text[:48].rstrip() + ("…" if len(text) > 48 else "")
+
+
+def empty_bucket():
+  return {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+  }
+
+
+def scan_session(path):
+  fallback = path.stat().st_mtime
+  latest = fallback
+  session_id = path.stem
+  title = ""
+  model = "codex"
+  usage_by_model = {}
+  model_reasoning = {}
+
+  with path.open(errors="replace") as handle:
+    for raw in handle:
+      try:
+        entry = json.loads(raw)
+      except Exception:
+        continue
+      latest = max(latest, timestamp(entry.get("timestamp"), fallback))
+      payload = entry.get("payload") or entry
+      if entry.get("type") == "session_meta" and isinstance(payload, dict):
+        session_id = str(payload.get("session_id") or payload.get("id") or session_id)
+      if entry.get("type") == "turn_context" and isinstance(payload, dict):
+        model = str(payload.get("model") or payload.get("model_slug") or model)
+        settings = (payload.get("collaboration_mode") or {}).get("settings") or {}
+        reasoning = payload.get("reasoning") or {}
+        if not isinstance(reasoning, dict):
+          reasoning = {"effort": reasoning}
+        effort = payload.get("effort") or payload.get("reasoning_effort") or reasoning.get("effort") or settings.get("reasoning_effort")
+        levels = model_reasoning.setdefault(model, [])
+        level = str(effort or "Not recorded")
+        if level not in levels:
+          levels.append(level)
+      if entry.get("type") == "event_msg" and isinstance(payload, dict):
+        if payload.get("type") == "user_message" and not title:
+          title = title_text(payload.get("message"))
+      if entry.get("type") == "response_item" and isinstance(payload, dict):
+        payload = payload.get("payload") or payload
+        if isinstance(payload, dict) and payload.get("type") == "message" \
+            and payload.get("role") == "user" and not title:
+          for content in payload.get("content") or []:
+            if isinstance(content, dict) and content.get("type") == "input_text":
+              title = title_text(content.get("text"))
+              if title:
+                break
+      if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        continue
+      stats = (payload.get("info") or {}).get("last_token_usage") or {}
+      cache_read = number(stats.get("cached_input_tokens"))
+      cache_write = number(stats.get("cache_write_input_tokens"))
+      input_tokens = max(0, number(stats.get("input_tokens")) - cache_read - cache_write)
+      output_tokens = number(stats.get("output_tokens"))
+      if not (input_tokens or output_tokens or cache_read or cache_write):
+        continue
+      bucket = usage_by_model.setdefault(model, empty_bucket())
+      bucket["inputTokens"] += input_tokens
+      bucket["outputTokens"] += output_tokens
+      bucket["cacheReadInputTokens"] += cache_read
+      bucket["cacheCreationInputTokens"] += cache_write
+
+  total = sum(sum(bucket.values()) for bucket in usage_by_model.values())
+  if total <= 0:
+    return None
+  if not title:
+    title = "Session " + session_id[:8]
+  return {
+    "id": session_id,
+    "title": title,
+    "updatedAt": datetime.fromtimestamp(latest, timezone.utc).isoformat(),
+    "updatedAtMs": int(latest * 1000),
+    "totalTokens": total,
+    "modelUsage": usage_by_model,
+    "modelReasoning": model_reasoning,
+  }
+
+
+def runtime_reasoning(codex_home, cache_dir):
+  """Read resolved per-turn effort from runtime spans, incrementally."""
+  cache_path = cache_dir / "codex-reasoning-log-index.json"
+  try:
+    cache = json.loads(cache_path.read_text())
+  except (OSError, ValueError):
+    cache = {}
+  by_session = cache.get("sessions", {})
+  last_id = cache.get("lastId", 0)
+  database = codex_home / "logs_2.sqlite"
+  if not database.exists():
+    return by_session
+  pattern = re.compile(r"turn\{[^}]*?model=([^\s}]+)\s+codex\.turn\.reasoning_effort=([^\s}]+)")
+  try:
+    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1) as connection:
+      for log_id, thread_id, body in connection.execute(
+          "SELECT id, thread_id, substr(feedback_log_body, 1, 2000) FROM logs WHERE id > ? ORDER BY id", (last_id,)):
+        last_id = log_id
+        if not thread_id or not body:
+          continue
+        match = pattern.search(body)
+        if not match:
+          continue
+        model, effort = match.groups()
+        levels = by_session.setdefault(thread_id, {}).setdefault(model, [])
+        if effort not in levels:
+          levels.append(effort)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".codex-reasoning-", dir=cache_dir)
+    try:
+      with os.fdopen(fd, "w") as handle:
+        json.dump({"lastId": last_id, "sessions": by_session}, handle, separators=(",", ":"))
+      os.replace(temporary, cache_path)
+    finally:
+      if os.path.exists(temporary):
+        os.unlink(temporary)
+  except (OSError, sqlite3.Error):
+    pass
+  return by_session
+
+
+def recent_sessions():
+  codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+  force = "--force" in sys.argv
+  cache_dir = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  cache_path = cache_dir / "codex-session-index-v1.json"
+  try:
+    cached = json.loads(cache_path.read_text())
+    old_files = cached.get("files", {}) if cached.get("schemaVersion") == 2 else {}
+  except (OSError, ValueError, AttributeError):
+    old_files = {}
+  new_files = {}
+  changed = False
+  sessions = []
+  for root in (codex_home / "sessions", codex_home / "archived_sessions"):
+    if not root.exists():
+      continue
+    for path in root.rglob("*.jsonl"):
+      try:
+        stat = path.stat()
+        signature = [stat.st_size, stat.st_mtime_ns]
+        key = str(path)
+        cached_file = old_files.get(key, {})
+        if not force and cached_file.get("signature") == signature:
+          session = cached_file.get("session")
+        else:
+          session = scan_session(path)
+          changed = True
+        new_files[key] = {"signature": signature, "session": session}
+        if session:
+          sessions.append(session)
+      except OSError:
+        continue
+  if set(old_files) != set(new_files):
+    changed = True
+  if changed:
+    try:
+      cache_dir.mkdir(parents=True, exist_ok=True)
+      fd, temporary = tempfile.mkstemp(prefix=".codex-session-index-", dir=cache_dir)
+      try:
+        with os.fdopen(fd, "w") as handle:
+          json.dump({"schemaVersion": 2, "files": new_files}, handle, separators=(",", ":"))
+        os.replace(temporary, cache_path)
+      finally:
+        if os.path.exists(temporary):
+          os.unlink(temporary)
+    except OSError:
+      pass
+  resolved = runtime_reasoning(codex_home, cache_dir)
+  for session in sessions:
+    # Copy cached data so resolved defaults do not masquerade as transcript fields.
+    reasoning = {model: list(levels) for model, levels in session.get("modelReasoning", {}).items()}
+    for model, levels in resolved.get(session["id"], {}).items():
+      existing = reasoning.setdefault(model, [])
+      existing[:] = [level for level in existing if level != "Not recorded"]
+      for level in levels:
+        if level not in existing:
+          existing.append(level)
+    session["modelReasoning"] = reasoning
+  sessions.sort(key=lambda item: item["updatedAtMs"], reverse=True)
+  # Keep the complete lightweight session index in the record. The panel
+  # applies its selected calendar scope first, then shows the five latest
+  # matches; truncating here made historical periods impossible to query.
+  return sessions
+
+
+record = json.load(sys.stdin)
+record["recentSessions"] = recent_sessions()
+json.dump(record, sys.stdout, separators=(",", ":"))
+sys.stdout.write("\n")

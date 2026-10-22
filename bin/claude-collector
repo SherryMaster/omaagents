@@ -1,0 +1,6 @@
+#!/bin/bash
+set -o pipefail
+
+# Omarchy's Claude collector supplies limits, plan, and today's counters; the
+# enricher adds the full daily history and sessions the panel's analytics need.
+/usr/share/omarchy/bin/omarchy-agent-usage-claude "$@" | "${BASH_SOURCE[0]%/*}/claude-session-enricher" "$@"
