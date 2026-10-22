@@ -189,7 +189,8 @@ Item {
   }
 
   function updateCommand(kind, agentIds) {
-    var command = [root.home + "/.config/omarchy/plugins/sherry.agents/bin/usage-update"]
+    // Resolved next to this file, so the plugin works from any install folder.
+    var command = [decodeURIComponent(String(Qt.resolvedUrl("bin/usage-update")).replace(/^[a-z]+:\/\//, ""))]
     if (kind === "force") command.push("--force")
     if (kind === "limits") command.push("--limits-only")
     if (kind === "fast") command.push("--fast")

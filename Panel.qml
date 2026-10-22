@@ -12,8 +12,8 @@ import "Analytics.js" as A
 // owns state, keyboard, IPC and the page switch; the pages draw themselves.
 Panel {
   id: root
-  moduleName: "omarchy.agents"
-  ipcTarget: "omarchy.agents"
+  moduleName: "io.github.sherrymaster.omaagents"
+  ipcTarget: "omaagents"
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground

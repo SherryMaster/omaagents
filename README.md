@@ -1,6 +1,31 @@
-# Agents
+# OmaAgents
 
-One bar icon and one panel for every AI coding subscription on the machine.
+AI coding agent usage for the [Omarchy](https://omarchy.org) bar. One icon
+shows your Claude Code / Codex session and weekly limits; click it for a calm
+glance at limits with pace, today's tokens and API-equivalent cost, and one
+step further for a details report: any period, models, sessions, cache hit
+rate and cost mix.
+
+Supports **Claude Code**, **Codex** and **Fireworks** (prepaid balance).
+
+## Install
+
+```bash
+omarchy plugin add https://github.com/SherryMaster/omaagents --enable
+```
+
+Then put it in your bar with `omarchy plugin enable io.github.sherrymaster.omaagents`
+(or pick it in the bar settings). Update later with
+`omarchy plugin update io.github.sherrymaster.omaagents`.
+
+**Requires** an Omarchy release that ships the agent usage collectors
+(`/usr/share/omarchy/bin/omarchy-agent-usage-*`), Python 3, and `jq`. Claude
+limits need a signed-in Claude Code CLI; Codex limits need a signed-in Codex
+CLI. Usage never leaves your machine except the providers' own limit
+endpoints that the Omarchy collectors already call.
+
+## How it works
+
 The panel is strictly a display: it watches the usage records that
 `bin/usage-update` writes to `~/.local/state/omarchy/agents/usage/` and draws
 whatever appears there. `Panel.qml` owns the bar button, the popup, keyboard
@@ -75,7 +100,7 @@ shows up at the next refresh, so nothing polls the disk waiting for it.
 That self-hiding is why the widget ships in the default bar layout: a machine
 that has never run an AI coding agent draws nothing, and the icon arrives on
 its own the first time a scan finds usage. Drop it with
-`omarchy plugin disable sherry.agents`.
+`omarchy plugin disable io.github.sherrymaster.omaagents`.
 
 ## Data
 
@@ -168,13 +193,13 @@ only adds the meter and the spent-of-funded line under the real figure.
   `j`/`k` scroll, Esc or Backspace go back. Closing the popup returns to the
   glance.
 - Tab moves to the neighbouring bar panel, as everywhere in the shell.
-- IPC: `omarchy-shell omarchy.agents <open|close|toggle|refresh|next|details>`.
+- IPC: `omarchy-shell omaagents <open|close|toggle|refresh|next|details>`.
 
 ## Settings
 
 Settings live in the widget's entry in `~/.config/omarchy/shell.json`. The
 top-level keys can be set with
-`omarchy bar set sherry.agents <key> <value>`:
+`omarchy bar set io.github.sherrymaster.omaagents <key> <value>`:
 
 | Key | Default | What it does |
 |---|---|---|
@@ -190,8 +215,8 @@ top-level keys can be set with
 Numbers need `--json`, or they land in `shell.json` as strings:
 
 ```bash
-omarchy bar set sherry.agents fastIntervalSec 5 --json
-omarchy bar set sherry.agents syncDir '~/Sync/agent-usage'
+omarchy bar set io.github.sherrymaster.omaagents fastIntervalSec 5 --json
+omarchy bar set io.github.sherrymaster.omaagents syncDir '~/Sync/agent-usage'
 ```
 
 Per-agent enablement is nested, and `set` writes its key literally rather
@@ -199,7 +224,7 @@ than walking a dotted path — so pass the whole `providers` object as JSON (or
 edit `shell.json` directly):
 
 ```bash
-omarchy bar set sherry.agents providers '{
+omarchy bar set io.github.sherrymaster.omaagents providers '{
   "claude": { "enabled": true },
   "codex": { "enabled": false },
   "fireworks": { "enabled": true }
@@ -231,3 +256,10 @@ recalculates every second while open and immediately on manual refresh,
 showing full days, then hours below one day, then minutes below one hour.
 Offline refreshes retain a valid cached date. Past login-token dates never
 produce an expiry message or an invented future billing period.
+
+## Credits
+
+Started as a clone of Omarchy's built-in `omarchy.agents` bar plugin and its
+usage collectors ([basecamp/omarchy](https://github.com/basecamp/omarchy),
+MIT). Rebuilt with a two-page panel, Claude daily history, sessions and cost,
+account display, and the analytics library.

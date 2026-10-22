@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "sherry.agents",
-  "name": "My Agents",
+  "id": "io.github.sherrymaster.omaagents",
+  "name": "OmaAgents",
   "version": "2.0.0",
-  "author": "Omarchy",
+  "author": "SherryMaster",
   "license": "MIT",
-  "description": "Claude Code, Codex, and Fireworks limits, tokens, and API-equivalent cost: a calm glance with a details report one step away.",
+  "description": "AI coding agent usage for the Omarchy bar: Claude Code, Codex and Fireworks limits with pace, today's tokens and API-equivalent cost at a glance, and a details report with models, sessions, cache and cost mix for any period.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "My Agents",
+    "displayName": "OmaAgents",
     "description": "Limits and today's tokens and cost at a glance; models, sessions, mix and any period in Details.",
     "category": "AI",
     "aliases": [
@@ -115,8 +115,5 @@
         "description": "Optional stable device name used inside synced aggregate snapshots."
       }
     ]
-  },
-  "omarchy": {
-    "clonedFrom": "omarchy.agents"
   }
 }
