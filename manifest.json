@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "sherry.agents",
   "name": "My Agents",
-  "version": "1.3.0",
+  "version": "2.0.0",
   "author": "Omarchy",
   "license": "MIT",
-  "description": "Claude Code, Codex, and Fireworks usage, limits, API-equivalent cost, and sessions in a native Omarchy bar panel.",
+  "description": "Claude Code, Codex, and Fireworks limits, tokens, and API-equivalent cost: a calm glance with a details report one step away.",
   "kinds": [
     "bar-widget"
   ],
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "My Agents",
-    "description": "One compact panel for limits and scoped usage across any day, week, month, year, subscription, custom span, or all time.",
+    "description": "Limits and today's tokens and cost at a glance; models, sessions, mix and any period in Details.",
     "category": "AI",
     "aliases": [
       "agents",
@@ -39,9 +39,31 @@
       "syncMode": "Off",
       "syncDir": "",
       "syncFileName": "",
-      "syncDeviceId": ""
+      "syncDeviceId": "",
+      "glancePeriod": "Today",
+      "showAccount": true
     },
     "schema": [
+      {
+        "key": "glancePeriod",
+        "type": "enum",
+        "label": "Glance period",
+        "options": [
+          "Today",
+          "7D",
+          "30D",
+          "Cycle"
+        ],
+        "defaultValue": "Today",
+        "description": "The period whose tokens and cost the first screen shows. Cycle falls back to Today without a renewal date."
+      },
+      {
+        "key": "showAccount",
+        "type": "boolean",
+        "label": "Show account email",
+        "defaultValue": true,
+        "description": "Turn off to keep the email out of screen shares."
+      },
       {
         "key": "refreshIntervalSec",
         "type": "integer",

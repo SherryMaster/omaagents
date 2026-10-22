@@ -5,7 +5,7 @@ import qs.Ui
 import "../Analytics.js" as A
 
 // name · cost · tokens, with a thin share bar underneath.
-Column {
+Item {
   id: model
   property var row: null
   property string name: ""
@@ -13,6 +13,11 @@ Column {
   property string fontFamily: Style.font.family
   readonly property color dim: Qt.darker(foreground, 1.55)
 
+  implicitHeight: rows.implicitHeight
+
+  Column {
+  id: rows
+  width: parent.width
   spacing: Style.space(3)
 
   Item {
@@ -61,6 +66,7 @@ Column {
       radius: parent.radius
       color: Qt.rgba(model.foreground.r, model.foreground.g, model.foreground.b, 0.55)
     }
+  }
   }
 
   MouseArea { id: hover; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
