@@ -2,55 +2,69 @@
 
 One bar icon and one panel for every AI coding subscription on the machine.
 The panel is strictly a display: it watches the usage records that
-`omarchy-agent-usage-update` writes to `~/.local/state/omarchy/agents/usage/`
-and draws whatever appears there. `Panel.qml` owns the bar button and the
-popup; `Main.qml` discovers and watches the records (and handles the optional
-cross-device aggregation); `Agent.qml` is the per-record file watcher.
+`bin/usage-update` writes to `~/.local/state/omarchy/agents/usage/` and draws
+whatever appears there. `Panel.qml` owns the bar button, the popup, keyboard
+and IPC; `GlanceView.qml` and `DetailsView.qml` are its two pages, built from
+`components/`; `Analytics.js` holds every calculation (pricing, periods,
+summaries, charts) as plain functions tested in `tests/`; `Main.qml` discovers
+and watches the records (and handles the optional cross-device aggregation);
+`Agent.qml` is the per-record file watcher.
 
 ## Panel
 
-- **Hero** — the mark, the tool, and the plan it runs on ("Max 20x", "Pro").
-  Auth and endpoint problems replace the plan line and repeat in a card.
-- **Subscription switch** — one chip per enabled agent (`h`/`l` or click).
-- **Subscription countdown** — the days remaining beside the plan in the
-  panel header. Codex reads it from the signed account token; Claude derives
-  the next renewal from the subscription start date Claude Code caches in
-  `~/.claude.json`, assuming monthly billing (an annual plan would show the
-  next monthly anniversary instead).
-- **Limits** — the percentage of each allowance used, a matching meter with a
-  pace tick (where usage would sit if spread evenly over the window, with
-  "ahead of"/"under pace" beside the reset time), and
-  the time until the session or weekly window resets.
-- **Balance** — prepaid agents report a credit ledger instead of limits:
-  remaining credit, a fuel-gauge meter that drains toward empty, and
-  funded-versus-spent detail.
-- **Insight** — a fourth analytics view for the selected period: daily
-  average per active day, projection to the period's end (or the peak day
-  once a period is over), cache hit rate, the API cost the cache saved, and a
-  100% stacked mix of input, output, cache-write, and cache-read tokens (or
-  their cost), largest first with values and shares. The Subscription period
-  covers the current billing cycle when a renewal date is known.
-- **Usage analytics** — a compact Tokens/Cost switch and period navigator
-  control the total, timeline, per-model, and session views. Sessions are
-  filtered to the selected period before the five latest matches are shown. The
-  period cycles through Today, Week, Month, Year, Subscription, All time, and
-  Custom; arrows browse a specific day/week/month/year, while Custom exposes
-  ISO start/end fields only while it is active. Sessions sort by their
-  latest interaction rather than creation time. Cost mode rates each day's,
-  model's, and session's uncached input, output, cache-read, and cache-write tokens against
-  the official standard API prices — OpenAI's for Codex, Anthropic's for
-  Claude. Claude's cache writes are split by TTL: 5-minute writes at 1.25x
-  input and 1-hour writes (Claude Code's default) at 2x. Internal model IDs
-  without a published price display an em dash and are excluded from cost
-  totals. The Cost switch is available for any agent with a priced model.
-  The plugin refreshes OpenAI's published Standard text-token rates once a day
-  and caches them in `~/.local/state/omarchy/agents/api-pricing.json`, so newly
-  listed models can be priced without editing the widget. It keeps the last
-  good cache if the page cannot be read. Bundled rates for GPT-6.1 Sol, GPT-6 Astra, Sol,
-  Luna, and GPT-5.6 remain available offline; Claude rates (Fable, Opus,
-  Sonnet, and Haiku, 4.5 onward) are bundled in `Panel.qml`. The estimate uses short-context
-  Standard rates; the usage records do not contain enough detail to identify
-  long-context requests or other API processing tiers.
+The popup has two pages. The first answers "how am I doing" without a click;
+everything deeper is one step away.
+
+**Glance**
+
+- **Header** — the agent's mark and name, the signed-in account email, and
+  the plan with its renewal countdown ("PRO · RENEWS IN 30 DAYS"). Auth and
+  endpoint problems replace the plan line and repeat in a card. On the right,
+  one small chip per enabled agent and the refresh button. With synced
+  numbers the email line adds "· N devices".
+- **Limits** — each allowance's percentage used, a meter with a pace tick
+  (where usage would sit if spread evenly over the window), and "Resets in …
+  · on pace / N% under / ahead of pace". Prepaid agents show their credit
+  balance instead.
+- **Today** — tokens and API-equivalent cost for the glance period (setting,
+  default Today) over a 7-day column chart; hover a column for its numbers.
+- **Details ›** — opens the report (Enter does too).
+
+**Details**
+
+- **Period** — one row: `Today · 7D · 30D · Cycle · All · …`. The line below
+  shows the range with `‹ ›` to step back and forward by the period's own
+  length (a day, 7 or 30 days, or a billing cycle). `…` is a custom range: the
+  range line turns into two date fields. Cycle appears when a renewal date is
+  known.
+- **Four figures** — cost, tokens (with active days), daily average per active
+  day (with a projection to renewal for the current cycle, otherwise the peak
+  day), and cache hit rate with the money the cache saved.
+- **By day / week / month** — columns stacked by the period's top models; the
+  unit coarsens for long periods. Hover for per-model numbers.
+- **Models** — cost and tokens per model with a share bar; hover for the
+  input/output/cache split.
+- **Mix** — a 100% bar of cost (or tokens when unpriced) by input, output,
+  cache write and cache read, labelled with values and shares.
+- **Sessions** — the five latest in the period; click one to expand its
+  models, tokens, cost, reasoning effort, cache hit rate and last activity.
+
+Cost rates input, output, cache-read and cache-write tokens at standard API
+prices — OpenAI's for Codex, Anthropic's for Claude — as an equivalent, not a
+charge. Claude's cache writes are split by TTL: 5-minute writes at 1.25x
+input, 1-hour writes (Claude Code's default) at 2x. Models without a
+published price show an em dash and are excluded from totals. OpenAI's
+Standard rates refresh daily into
+`~/.local/state/omarchy/agents/api-pricing.json` (the last good copy is kept);
+bundled rates for both providers live in `Analytics.js` for offline use. The
+estimate uses short-context Standard rates; the records cannot identify
+long-context requests or other processing tiers.
+
+**Account and renewal.** Claude's email and subscription start come from
+`~/.claude.json`; the renewal assumes monthly billing anchored on the start
+date. Codex's email is the `email` claim of the locally stored ChatGPT id
+token (decoded on the machine, never sent anywhere); its renewal comes from
+the account's live entitlement.
 
 A subscription appears only when it is enabled in settings and has actually
 recorded usage — on this machine or on a synced one. With one such agent
@@ -145,15 +159,16 @@ only adds the meter and the spent-of-funded line under the real figure.
   and 95% used: green, teal, lime, amber, orange, then red.
 - Failed refreshes retain last known limits in memory and mark them stale in
   the bar tooltip. Automatic refresh continues at the configured interval.
-- Hero refresh button: refresh the selected subscription immediately; Codex
+- Refresh button: refresh the selected subscription immediately; Codex
   local usage appears first, then its account limits. The button spins while
   the selected provider check is running.
-- Panel: click the period label to move forward through scopes and right-click
-  it to move backward; period arrows browse historical calendar periods.
-  `h`/`l` switch subscription, `j`/`k` scroll, `r` or Enter refresh,
-  `t`/`c` switch metric, `1`/`2`/`3`/`4` select day/model/sessions/insight, Tab moves to
-  the neighboring bar panel, Esc closes.
-- IPC: `omarchy-shell omarchy.agents <open|close|toggle|refresh|next>`.
+- Glance: `h`/`l` or the header chips switch agent, `r` refreshes, Enter opens
+  Details, Esc closes.
+- Details: `←`/`→` step the period, `1`–`5` pick Today/7D/30D/Cycle/All,
+  `j`/`k` scroll, Esc or Backspace go back. Closing the popup returns to the
+  glance.
+- Tab moves to the neighbouring bar panel, as everywhere in the shell.
+- IPC: `omarchy-shell omarchy.agents <open|close|toggle|refresh|next|details>`.
 
 ## Settings
 
@@ -163,6 +178,8 @@ top-level keys can be set with
 
 | Key | Default | What it does |
 |---|---|---|
+| `glancePeriod` | `"Today"` | Period on the glance: `Today`, `7D`, `30D` or `Cycle` |
+| `showAccount` | `true` | Show the account email (turn off for screen sharing) |
 | `refreshIntervalSec` | `300` | Full refresh of all providers, including billing |
 | `fastIntervalSec` | `5` | Codex local usage refresh interval |
 | `syncMode` | `"Off"` | `"On"` writes this machine's snapshot and merges the others |
