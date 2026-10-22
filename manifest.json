@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.sherrymaster.omaagents",
   "name": "OmaAgents",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "SherryMaster",
   "license": "MIT",
   "description": "AI coding agent usage for the Omarchy bar: Claude Code, Codex and Fireworks limits with pace, today's tokens and API-equivalent cost at a glance, and a details report with models, sessions, cache and cost mix for any period.",
