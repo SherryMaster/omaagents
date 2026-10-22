@@ -31,9 +31,12 @@ Column {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string renewal: provider ? String(provider.subscriptionEndsAt || "") : ""
   readonly property bool cycleAvailable: A.periodRange("cycle", 0, todayIso, renewal, "", "").available
-  readonly property var range: A.periodRange(periodKind, periodOffset, todayIso, renewal, customStart, customEnd)
+  readonly property var range: A.resolvePeriod(periodKind, periodOffset, todayIso, renewal, customStart, customEnd)
+  readonly property bool pricedProvider: A.providerPriced(provider, published)
   readonly property var days: provider ? A.daysInRange(provider.dailyUsage || [], range) : []
-  readonly property var stats: A.summary(days, range, todayIso, published)
+  readonly property var stats: A.summary(days, range, todayIso, published, pricedProvider)
+  // A date field has focus: the panel's key handler must let typing through.
+  readonly property bool editing: startField.activeFocus || endField.activeFocus
   readonly property var buckets: A.chartBuckets(days, range, todayIso, published, 3)
   readonly property var models: A.modelRows(A.sumUsage(days), published)
   readonly property var chartModels: {
@@ -42,8 +45,7 @@ Column {
     return names
   }
   readonly property var sessions: provider ? A.sessionRows(provider.recentSessions || [], range, published, 5) : []
-  readonly property string unit: buckets.length && buckets[0].first !== buckets[0].last
-    ? (buckets[0].key.length === 7 ? "MONTH" : "WEEK") : "DAY"
+  readonly property string unit: buckets.length ? buckets[0].unit.toUpperCase() : "DAY"
   readonly property var pills: {
     var out = [{ kind: "today", label: "Today" }, { kind: "7d", label: "7D" }, { kind: "30d", label: "30D" }]
     if (cycleAvailable) out.push({ kind: "cycle", label: "Cycle" })
@@ -113,7 +115,7 @@ Column {
           width: (pillRow.width - pillRow.spacing * (details.pills.length - 1)) / details.pills.length
           text: modelData.label
           tooltipText: modelData.kind === "custom" ? "Custom range" : ""
-          selected: details.periodKind === modelData.kind
+          selected: details.range.kind === modelData.kind
           bordered: true
           foreground: details.foreground
           fontFamily: details.fontFamily
@@ -140,7 +142,7 @@ Column {
         MouseArea { anchors.fill: parent; anchors.margins: -6; cursorShape: Qt.PointingHandCursor; onClicked: details.stepRequested(-1) }
       }
       Text {
-        visible: details.periodKind !== "custom"
+        visible: details.range.kind !== "custom"
         text: details.range.label
         color: details.foreground
         font.family: details.fontFamily
@@ -164,36 +166,36 @@ Column {
         }
       }
 
-      // Custom: the range line becomes its own two date fields.
+      // Custom: the range line becomes its own two date fields. They are
+      // fixed items, not a Repeater, so committing a date never destroys
+      // the field that holds focus.
       Row {
-        visible: details.periodKind === "custom"
+        visible: details.range.kind === "custom"
         anchors.fill: parent
         spacing: Style.space(8)
-        Repeater {
-          model: [details.customStart, details.customEnd]
-          Rectangle {
-            required property string modelData
-            required property int index
-            width: (parent.width - Style.space(8)) / 2
-            height: parent.height
-            radius: Style.cornerRadius
-            color: Qt.rgba(details.foreground.r, details.foreground.g, details.foreground.b, 0.04)
-            border.color: Qt.rgba(details.foreground.r, details.foreground.g, details.foreground.b, input.activeFocus ? 0.6 : 0.25)
-            TextInput {
-              id: input
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(8)
-              verticalAlignment: TextInput.AlignVCenter
-              text: modelData
-              color: details.foreground
-              font.family: details.fontFamily
-              font.pixelSize: Style.font.caption
-              inputMask: "9999-99-99"
-              selectByMouse: true
-              onEditingFinished: index === 0 ? details.customChanged(text, details.customEnd)
-                : details.customChanged(details.customStart, text)
-            }
-          }
+        TextField {
+          id: startField
+          width: (parent.width - parent.spacing) / 2
+          height: parent.height
+          text: details.customStart
+          inputMask: "9999-99-99"
+          foreground: details.foreground
+          font.family: details.fontFamily
+          font.pixelSize: Style.font.caption
+          verticalPadding: 0
+          onEditingFinished: details.customChanged(text, details.customEnd)
+        }
+        TextField {
+          id: endField
+          width: (parent.width - parent.spacing) / 2
+          height: parent.height
+          text: details.customEnd
+          inputMask: "9999-99-99"
+          foreground: details.foreground
+          font.family: details.fontFamily
+          font.pixelSize: Style.font.caption
+          verticalPadding: 0
+          onEditingFinished: details.customChanged(details.customStart, text)
         }
       }
     }

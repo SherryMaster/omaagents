@@ -152,3 +152,29 @@ test("limit windows, pace and header line", () => {
   assert.equal(A.planLine({ tierLabel: "pro", subscriptionEndsAt: "2026-11-22T00:00:00Z" }, now), "Pro · renews in 30 days")
   assert.equal(A.planLine({ tierLabel: "", usageStatusText: "Sign-in expired" }, now), "Sign-in expired")
 })
+
+test("resolvePeriod falls back when cycle has no renewal", () => {
+  assert.equal(A.resolvePeriod("cycle", 0, "2026-10-22", "", "", "").kind, "7d")
+  assert.equal(A.resolvePeriod("cycle", 0, "2026-10-22", "2026-11-22", "", "").kind, "cycle")
+  assert.equal(A.resolvePeriod("30d", -1, "2026-10-22", "", "", "").start, "2026-08-24")
+})
+
+test("an empty period on a priced provider costs $0, not —", () => {
+  const range = A.periodRange("today", 0, "2026-10-22", "", "", "")
+  const s = A.summary([], range, "2026-10-22", {}, true)
+  assert.equal(s.cost, 0)
+  assert.equal(s.priced, true)
+  assert.equal(s.avgCost, 0)
+  assert.equal(A.summary([], range, "2026-10-22", {}, false).cost, -1)
+  assert.equal(A.providerPriced({ modelUsage: { "claude-opus-5-5": bucket(1, 1, 0, 0, 0) } }, {}), true)
+  assert.equal(A.providerPriced({ modelUsage: { "fireworks/x": bucket(1, 1, 0, 0, 0) } }, {}), false)
+})
+
+test("chartBuckets reports its unit even when the first bucket is one day", () => {
+  const custom = A.periodRange("custom", 0, "2026-10-22", "", "2026-08-02", "2026-10-22")
+  const weeks = A.chartBuckets([], custom, "2026-10-22", {}, 3)
+  assert.equal(weeks[0].unit, "week")
+  assert.equal(weeks[0].first, "2026-08-02")
+  const days = A.chartBuckets([], A.periodRange("7d", 0, "2026-10-22", "", "", ""), "2026-10-22", {}, 3)
+  assert.equal(days[0].unit, "day")
+})

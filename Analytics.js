@@ -190,6 +190,24 @@ function periodRange(kind, offset, todayIso, renewalIso, customStart, customEnd)
   return out
 }
 
+// The period to show: a Cycle without a renewal date has no bounds, so it
+// becomes 7D rather than silently reporting all-time numbers.
+function resolvePeriod(kind, offset, todayIso, renewalIso, customStart, customEnd) {
+  var range = periodRange(kind, offset, todayIso, renewalIso, customStart, customEnd)
+  return range.available ? range : periodRange("7d", 0, todayIso, renewalIso, customStart, customEnd)
+}
+
+// Whether any model this provider has used has a price, judged on its whole
+// history so a quiet period still reads "$0.00" instead of "—".
+function providerPriced(p, published) {
+  if (!p) return false
+  if (usageCost(p.modelUsage || {}, published).priced) return true
+  var days = p.dailyUsage || []
+  for (var i = days.length - 1; i >= 0; i--)
+    if (usageCost((days[i] || {}).modelUsage || {}, published).priced) return true
+  return false
+}
+
 function inRange(date, range) {
   return date !== "" && (range.start === "" || date >= range.start) && (range.end === "" || date <= range.end)
 }
@@ -238,10 +256,12 @@ function dayTokens(day) {
   return total
 }
 
-function summary(days, range, todayIso, published) {
+function summary(days, range, todayIso, published, pricedProvider) {
   days = days || []
   var byModel = sumUsage(days)
   var cost = usageCost(byModel, published)
+  // Nothing used in the period: a priced provider spent $0.
+  if (!cost.priced && cost.unpriced === 0 && pricedProvider === true) cost.priced = true
   var kinds = emptyBucket(), kindCost = emptyBucket(), savings = 0
   for (var id in byModel) {
     var bucket = byModel[id]
@@ -335,8 +355,8 @@ function chartBuckets(days, range, todayIso, published, topN) {
   var order = [], buckets = {}
   function ensure(key, first) {
     if (buckets[key]) return buckets[key]
-    var label = unit === "day" ? weekday(first) : (unit === "week" ? shortDate(key) : MONTHS[+key.slice(5, 7) - 1])
-    buckets[key] = { key: key, label: label, first: first, last: first, isToday: false, tokens: 0, cost: 0, usage: {} }
+    var label = unit === "day" ? weekday(first) : (unit === "week" ? shortDate(first) : MONTHS[+key.slice(5, 7) - 1])
+    buckets[key] = { key: key, unit: unit, label: label, first: first, last: first, isToday: false, tokens: 0, cost: 0, usage: {} }
     order.push(key)
     return buckets[key]
   }

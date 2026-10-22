@@ -36,7 +36,8 @@ Column {
     return r.available ? r : A.periodRange("today", 0, todayIso, renewal, "", "")
   }
   readonly property var days: provider ? A.daysInRange(provider.dailyUsage || [], range) : []
-  readonly property var stats: A.summary(days, range, todayIso, published)
+  readonly property bool pricedProvider: A.providerPriced(provider, published)
+  readonly property var stats: A.summary(days, range, todayIso, published, pricedProvider)
   readonly property var week: A.periodRange("7d", 0, todayIso, "", "", "")
   readonly property var weekBuckets: provider
     ? A.chartBuckets(A.daysInRange(provider.dailyUsage || [], week), week, todayIso, published, 3) : []
@@ -245,8 +246,14 @@ Column {
       buckets: glance.weekBuckets
       rightLabel: "Today"
       tooltipFor: function(b) {
-        return b.label + " " + b.first.slice(5).replace("-", "/") + " · " + A.formatTokens(b.tokens) + " tokens"
-          + (glance.stats.priced ? " · " + A.formatMoney(b.cost) : "")
+        var text = b.label + " " + b.first.slice(5).replace("-", "/") + " · " + A.formatTokens(b.tokens) + " tokens"
+          + (glance.pricedProvider ? " · " + A.formatMoney(b.cost) : "")
+        // Prompt and session counts only exist for today, and billing-API
+        // agents never count them.
+        if (b.isToday && glance.provider && glance.provider.hasPromptStats !== false)
+          text += "\n" + Number(glance.provider.todayPrompts || 0) + " prompts · "
+            + Number(glance.provider.todaySessions || 0) + " sessions"
+        return text
       }
       foreground: glance.foreground
       fontFamily: glance.fontFamily

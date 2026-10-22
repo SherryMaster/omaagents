@@ -105,9 +105,11 @@ Panel {
   function showGlance() {
     page = "glance"
     flick.contentY = 0
+    keyCatcher.forceActiveFocus()
   }
 
   function pickPeriod(kind) {
+    keyCatcher.forceActiveFocus()
     periodKind = kind
     periodOffset = 0
     if (kind === "custom" && customStart === "") {
@@ -119,9 +121,10 @@ Panel {
   }
 
   function stepPeriod(delta) {
-    var range = A.periodRange(periodKind, periodOffset, todayIso, provider ? provider.subscriptionEndsAt : "", customStart, customEnd)
+    var range = A.resolvePeriod(periodKind, periodOffset, todayIso, provider ? provider.subscriptionEndsAt : "", customStart, customEnd)
+    if (range.kind !== periodKind) { periodKind = range.kind; periodOffset = 0 }
     if (delta < 0 && range.canStepBack) periodOffset--
-    if (delta > 0 && range.canStepForward) periodOffset++
+    if (delta > 0 && range.canStepForward) periodOffset = Math.min(0, periodOffset + 1)
   }
 
   function scrollBy(steps) {
@@ -243,6 +246,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: root.page === "details" && details.editing
 
       onMoveRequested: function(dx, dy) {
         if (dx !== 0) root.page === "glance" ? root.selectProvider(root.providerIndex + dx) : root.stepPeriod(dx)
@@ -254,8 +258,8 @@ Panel {
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refreshNow()
         else if (root.page === "details" && (t === "\b" || t === "\x7f")) root.showGlance()
-        else if (root.page === "details" && t >= "1" && t <= "5")
-          root.pickPeriod(["today", "7d", "30d", "cycle", "all"][Number(t) - 1])
+        else if (root.page === "details" && t >= "1" && t <= "9" && Number(t) <= details.pills.length)
+          root.pickPeriod(details.pills[Number(t) - 1].kind)
       }
 
       Text {
@@ -334,7 +338,11 @@ Panel {
             onBackRequested: root.showGlance()
             onPeriodPicked: function(kind) { root.pickPeriod(kind) }
             onStepRequested: function(delta) { root.stepPeriod(delta) }
-            onCustomChanged: function(start, end) { root.customStart = start; root.customEnd = end }
+            onCustomChanged: function(start, end) {
+              root.customStart = start
+              root.customEnd = end
+              keyCatcher.forceActiveFocus()
+            }
             onSessionToggled: function(id) { root.expandedSessionId = root.expandedSessionId === id ? "" : id }
             onRefreshRequested: root.refreshNow()
           }
