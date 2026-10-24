@@ -92,6 +92,11 @@ replacements = [
   (
     "  rpc = fetch_codex_rpc()\n",
     "  rpc = cached_codex_rpc() if args.local_only else fetch_codex_rpc()\n"
+    "  if not args.local_only:\n"
+    "    if rpc.get(\"limits\") and not rpc.get(\"usageStatusText\"):\n"
+    "      rpc[\"limitsFetchedAtMs\"] = round(time.time() * 1000)\n"
+    "    elif \"limitsFetchedAtMs\" in cached_codex_rpc():\n"
+    "      rpc[\"limitsFetchedAtMs\"] = cached_codex_rpc()[\"limitsFetchedAtMs\"]\n"
     "  rpc[\"subscriptionEndsAt\"] = subscription_ends_at(fetch=not args.local_only)\n",
   ),
 ]
@@ -100,4 +105,4 @@ for old, new in replacements:
     raise SystemExit("codex-collector: packaged collector changed; patch anchor missing")
   source = source.replace(old, new, 1)
 sys.stdout.write(source)
-' | /usr/bin/python3 - "$@" | "${BASH_SOURCE[0]%/*}/codex-session-enricher" "$@" | "${BASH_SOURCE[0]%/*}/codex-account"
+' | /usr/bin/python3 - "$@" | "${BASH_SOURCE[0]%/*}/codex-session-enricher" "$@" | "${BASH_SOURCE[0]%/*}/codex-account" | "${BASH_SOURCE[0]%/*}/account-pool" codex "$@"

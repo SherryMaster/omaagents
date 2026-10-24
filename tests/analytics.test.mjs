@@ -199,3 +199,115 @@ test("monthPreset gives calendar ranges clipped to today", () => {
   assert.deepEqual(A.monthPreset("thisYear", "2026-10-22"), { start: "2026-01-01", end: "2026-10-22" })
   assert.deepEqual(A.monthPreset("lastMonth", "2026-01-15"), { start: "2025-12-01", end: "2025-12-31" })
 })
+
+test("limitsFreshness says how old the limits are and why they are stale", () => {
+  const now = 1_800_000_000_000
+  assert.equal(A.limitsFreshness({}, now), "")
+  assert.equal(A.limitsFreshness({ limitsFetchedAtMs: now - 2000 }, now), "Updated just now")
+  assert.equal(A.limitsFreshness({ limitsFetchedAtMs: now - 42000 }, now), "Updated 42s ago")
+  assert.equal(A.limitsFreshness({ limitsFetchedAtMs: now - 185000 }, now), "Updated 3m ago")
+  assert.equal(A.limitsFreshness({
+    limitsFetchedAtMs: now - 185000, limitsStale: true, limitsNote: "rate-limited", limitsRetryAtMs: now + 30500,
+  }, now), "Updated 3m ago · rate-limited, retrying in 31s")
+  assert.equal(A.limitsFreshness({ limitsFetchedAtMs: now - 185000, limitsStale: true }, now), "Updated 3m ago · stale")
+})
+
+// ---------------------------------------------------------------- pool
+const NOW = Date.parse("2026-10-24T08:00:00Z")
+const inH = (h) => new Date(NOW + h * 3600000).toISOString()
+const win = (lengthSec, percent, resetH, started = true) => ({ lengthSec, percent, resetsAt: inH(resetH), started })
+const POOL = {
+  routed: true, endpoint: "127.0.0.1:8317",
+  accounts: [
+    { id: "f1", email: "free1@x", plan: "free", priority: 0, status: "ok", windows: [win(2592000, 0.25, 600)] },
+    { id: "p2", email: "b@x", plan: "plus", priority: 100, status: "ok", lastActiveMs: NOW - 60000,
+      windows: [win(18000, 0.5, 2.5), win(604800, 0.4, 84)] },
+    { id: "p1", email: "a@x", plan: "plus", priority: 100, status: "ok",
+      windows: [win(18000, 0, 5, false), win(604800, 0.2, 100)] },
+    { id: "p3", email: "c@x", plan: "plus", priority: 100, status: "limited",
+      windows: [win(18000, 1, 1), win(604800, 0.6, 50)] },
+    { id: "x", email: "dead@x", plan: "plus", priority: 100, status: "expired", windows: [] },
+    { id: "d", email: "off@x", plan: "free", priority: 0, status: "disabled", windows: [] },
+  ],
+}
+
+test("accountView classifies idle, running, limited, expired", () => {
+  const s = A.poolSummary(POOL, NOW)
+  const by = Object.fromEntries(s.accounts.map((a) => [a.id, a]))
+  assert.equal(by.p1.status, "idle"); assert.equal(by.p1.kickable, true)
+  assert.equal(by.p2.status, "running"); assert.equal(by.p2.kickable, false)
+  assert.equal(by.p3.status, "limited"); close(by.p3.freeInMs, 3600000)
+  assert.equal(by.x.status, "expired")
+  assert.equal(by.d.status, "disabled")
+  assert.deepEqual(s.kickable.map((a) => a.id), ["p1"])
+})
+
+test("a window whose reset passed reads as reset", () => {
+  const a = A.accountView({ id: "z", status: "limited", windows: [win(18000, 1, -1)] }, NOW)
+  assert.equal(a.status, "idle")
+  assert.equal(a.windows[0].percent, 0)
+  assert.equal(A.accountView({ id: "y", status: "limited", windows: [] }, NOW).status, "limited")
+})
+
+test("poolSummary tiers by priority, plans first, emails next", () => {
+  const s = A.poolSummary(POOL, NOW)
+  assert.deepEqual(s.tiers.map((t) => [t.priority, t.label, t.open, t.total]), [[100, "Plus", 2, 4], [0, "Free", 1, 1]])
+  assert.deepEqual(s.tiers[0].accounts.map((a) => a.id), ["p1", "p2", "p3", "x"])
+  // The expired account holds no capacity, so the averages skip it.
+  const [session, weekly] = s.tiers[0].windows
+  close(session.percent, 0.5)
+  assert.equal(session.full, 1)
+  close(session.freeInMs, 3600000)
+  close(weekly.percent, 0.4)
+})
+
+test("poolLimits feeds the bar and meters", () => {
+  const limits = A.poolLimits(POOL, NOW)
+  assert.deepEqual(limits.map((l) => l.title), ["Session", "Weekly"])
+  assert.equal(limits[0].subtitle, "3 Plus pooled")
+  const windows = A.limitWindows({ limits })
+  close(A.paceFor(windows[0], NOW), limits[0].pace)
+  assert.match(A.limitDetail(windows[0], NOW), /^2\/3 have room · frees up in 1h 0m · /)
+  assert.match(A.limitDetail(windows[1], NOW), /^2\/4 open · next reset 2d 2h · /)
+  assert.deepEqual(A.poolLimits({ accounts: [] }, NOW), [])
+})
+
+test("one account reads as one account", () => {
+  const solo = { routed: true, accounts: [
+    { id: "s", email: "solo@x", plan: "pro", priority: 0, status: "ok", windows: [win(18000, 0.3, 2), win(604800, 0.1, 100)] },
+    { id: "off", email: "off@x", plan: "plus", priority: 0, status: "disabled", windows: [] },
+  ] }
+  const s = A.poolSummary(solo, NOW)
+  assert.equal(s.single, true)
+  assert.equal(s.only.id, "s")
+  assert.equal(A.poolPlanLine(solo, NOW), "Pro · via CPAMC")
+  const limits = A.poolLimits(solo, NOW)
+  assert.deepEqual(limits.map((l) => [l.title, l.label, l.pool]), [["Session", "5h window", undefined], ["Weekly", "Weekly (7-day)", undefined]])
+  const windows = A.limitWindows({ limits })
+  assert.match(A.limitDetail(windows[0], NOW), /^Resets in 2h 0m · /)
+  // A pool whose serving tier has one account left with capacity shows that account, not an average.
+  const leftover = { routed: true, accounts: [POOL.accounts[1], { ...POOL.accounts[2], status: "expired" }] }
+  assert.equal(A.poolSummary(leftover, NOW).single, false)
+  assert.equal(A.poolLimits(leftover, NOW)[0].pool, undefined)
+  close(A.poolLimits(leftover, NOW)[0].percent, 0.5)
+})
+
+test("poolPlanLine", () => {
+  assert.equal(A.poolPlanLine(POOL, NOW), "Pool · 4 Plus + 1 Free")
+  assert.equal(A.poolPlanLine({ ...POOL, routed: false }, NOW), "CPAMC · 4 Plus + 1 Free")
+})
+
+test("in use only while usage keeps rising", () => {
+  const running = (last) => ({ id: "r", status: "ok", lastActiveMs: last, windows: [win(18000, 0.3, 3)] })
+  assert.equal(A.accountView(running(NOW - 60000), NOW).status, "running")
+  assert.equal(A.accountView(running(NOW - 4 * 60000), NOW).status, "quiet")
+  assert.equal(A.accountView(running(NOW - 11 * 60000), NOW).status, "quiet")
+  assert.equal(A.accountView(running(0), NOW).status, "quiet")
+  assert.equal(A.accountView(running(NOW - 11 * 60000), NOW, 20 * 60000).status, "running")
+  const busy = A.accountView({ ...running(NOW - 30000),
+    recentTokens: [[NOW - 10 * 60000, 999], [NOW - 120000, 4000], [NOW - 60000, 1500]] }, NOW)
+  assert.equal(busy.recentTokens, 5500)
+  const quiet = A.accountView(running(0), NOW)
+  assert.equal(quiet.usable, true)
+  assert.equal(quiet.kickable, false)
+})

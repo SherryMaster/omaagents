@@ -25,9 +25,11 @@ Column {
       anchors.fill: parent
       spacing: 1
       Repeater {
-        model: mix.rows
+        // Counted, not the array itself: a new array would rebuild every row.
+        model: mix.rows.length
         Rectangle {
-          required property var modelData
+          // The row stays put across refreshes; only what it shows changes.
+          readonly property var modelData: mix.rows[index] || ({ share: 0 })
           required property int index
           visible: modelData.share > 0
           width: Math.max(0, (mix.width - (mix.rows.length - 1)) * modelData.share)
@@ -46,9 +48,11 @@ Column {
     columnSpacing: Style.spacing.lg
     rowSpacing: Style.space(4)
     Repeater {
-      model: mix.rows
+      // Counted, not the array itself: a new array would rebuild every row.
+      model: mix.rows.length
       Item {
-        required property var modelData
+        // The row stays put across refreshes; only what it shows changes.
+        readonly property var modelData: mix.rows[index] || ({ share: 0 })
         required property int index
         width: (legend.width - legend.columnSpacing) / 2
         implicitHeight: name.implicitHeight

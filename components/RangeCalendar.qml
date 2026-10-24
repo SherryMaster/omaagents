@@ -157,10 +157,13 @@ Column {
     }
 
     Repeater {
-      model: calendar.cells
+      // Counted, not the array itself: a new array would rebuild every row.
+      model: calendar.cells.length
       Item {
         id: day
-        required property var modelData
+        required property int index
+        // The row stays put across refreshes; only what it shows changes.
+        readonly property var modelData: calendar.cells[index] || ({})
         width: grid.cell
         height: Style.space(26)
         readonly property bool edge: modelData.iso === calendar.lo || modelData.iso === calendar.hi

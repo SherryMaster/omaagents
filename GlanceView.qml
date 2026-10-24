@@ -17,19 +17,26 @@ Column {
   property real nowMs: 0
   property string glancePeriod: "today"
   property bool showAccount: true
-  property bool refreshing: false
+  property real inUseMs: 180000
   property string fallbackGlyph: ""
   property string footer: ""
   property color surface: Color.background
   property color foreground: Color.foreground
   property string fontFamily: Style.font.family
   property var friendlyModelName: function(id) { return id }
+  property var kicker: null
+  property var kickSelection: ({})
+  property var expandedTiers: ({})
   signal providerPicked(int index)
-  signal refreshRequested()
   signal detailsRequested()
+  signal accountToggled(string id)
+  signal kickRequested()
+  signal kickSelectionCleared()
+  signal tierToggled(int priority, bool expanded)
 
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property var limits: A.limitWindows(provider)
+  readonly property var poolSummary: provider && provider.pool ? A.poolSummary(provider.pool, nowMs, inUseMs) : null
   readonly property var renewal: provider ? String(provider.subscriptionEndsAt || "") : ""
   readonly property var range: {
     var r = A.periodRange(glancePeriod, 0, todayIso, renewal, "", "")
@@ -44,7 +51,10 @@ Column {
   readonly property string accountLine: {
     if (!provider) return ""
     var parts = []
-    if (showAccount && String(provider.accountLabel || "") !== "") parts.push(provider.accountLabel)
+    if (provider.pooled && poolSummary.single)
+      parts.push((showAccount ? poolSummary.only.email : "1 account") + " via CPAMC")
+    else if (provider.pooled) parts.push(poolSummary.total + " accounts via CPAMC")
+    else if (showAccount && String(provider.accountLabel || "") !== "") parts.push(provider.accountLabel)
     if (provider.syncEnabled && provider.syncDeviceCount > 0)
       parts.push(provider.syncDeviceCount + (provider.syncDeviceCount === 1 ? " device" : " devices"))
     return parts.join(" · ")
@@ -52,7 +62,7 @@ Column {
 
   spacing: Style.spacing.lg
 
-  // ---------- Header: mark · name / account / plan · chips · refresh
+  // ---------- Header: mark · name / account / plan · chips
   Item {
     width: parent.width
     implicitHeight: Math.max(identity.implicitHeight, controls.implicitHeight)
@@ -99,7 +109,8 @@ Column {
       Text {
         visible: text !== ""
         width: parent.width
-        text: A.planLine(glance.provider, glance.nowMs).toUpperCase()
+        text: (glance.provider && glance.provider.pooled ? A.poolPlanLine(glance.provider.pool, glance.nowMs)
+          : A.planLine(glance.provider, glance.nowMs)).toUpperCase()
         color: glance.provider && String(glance.provider.usageStatusText || "") !== "" ? Color.urgent : glance.dim
         font.family: glance.fontFamily
         font.pixelSize: Style.font.caption
@@ -123,12 +134,6 @@ Column {
         foreground: glance.foreground
         fontFamily: glance.fontFamily
         onPicked: function(index) { glance.providerPicked(index) }
-      }
-      RefreshButton {
-        busy: glance.refreshing
-        foreground: glance.foreground
-        fontFamily: glance.fontFamily
-        onTriggered: glance.refreshRequested()
       }
     }
   }
@@ -179,9 +184,12 @@ Column {
     }
 
     Repeater {
-      model: glance.limits
+      // Counted, not the array itself: a new array would rebuild every row.
+      model: glance.limits.length
       LimitRow {
-        required property var modelData
+        required property int index
+        // The row stays put across refreshes; only what it shows changes.
+        readonly property var modelData: glance.limits[index] || null
         width: glance.width
         window: modelData
         pace: A.paceFor(modelData, glance.nowMs)
@@ -190,6 +198,42 @@ Column {
         fontFamily: glance.fontFamily
       }
     }
+
+    // Limits refresh on their own; this says how old they are, and why
+    // when the provider refused the last check.
+    Text {
+      visible: text !== "" && glance.limits.length > 0
+      width: parent.width
+      text: A.limitsFreshness(glance.provider, glance.nowMs)
+      // A refused check is routine; numbers older than ten minutes are not.
+      color: glance.provider && glance.provider.limitsStale === true
+        && glance.nowMs - Number(glance.provider.limitsFetchedAtMs || 0) > 600000 ? Color.urgent : glance.dim
+      font.family: glance.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
+  }
+
+  // ---------- The accounts behind the limits, when CPAMC pools them
+  AccountPool {
+    visible: !!glance.poolSummary
+    width: parent.width
+    summary: glance.poolSummary
+    nowMs: glance.nowMs
+    canKick: !!glance.provider && glance.provider.providerId === "codex"
+    kicker: glance.kicker
+    selection: glance.kickSelection
+    expandedTiers: glance.expandedTiers
+    showEmail: glance.showAccount
+    inUseMs: glance.inUseMs
+    signedInEmail: glance.provider ? String(glance.provider.accountLabel || "") : ""
+    agentName: glance.provider ? glance.provider.providerName : ""
+    foreground: glance.foreground
+    fontFamily: glance.fontFamily
+    onToggled: function(id) { glance.accountToggled(id) }
+    onKickRequested: glance.kickRequested()
+    onSelectionCleared: glance.kickSelectionCleared()
+    onTierToggled: function(priority, expanded) { glance.tierToggled(priority, expanded) }
   }
 
   // ---------- The period's figures

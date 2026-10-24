@@ -38,13 +38,18 @@ Column {
     spacing: Math.max(1, Math.min(Style.space(4), Math.floor(width / Math.max(1, chart.buckets.length) * 0.2)))
 
     Repeater {
-      model: chart.buckets
+      // Counted, not the array itself: a new array would rebuild every row.
+      model: chart.buckets.length
       Item {
         id: column
-        required property var modelData
+        required property int index
+        // The row stays put across refreshes; only what it shows changes.
+        readonly property var modelData: chart.buckets[index] || ({ tokens: 0, cost: 0, segments: [] })
         width: (columns.width - columns.spacing * (chart.buckets.length - 1)) / Math.max(1, chart.buckets.length)
         height: columns.height
         readonly property real value: chart.useCost ? modelData.cost : modelData.tokens
+        readonly property var slices: chart.stacked ? (modelData.segments || [])
+          : [{ model: "", tokens: modelData.tokens, cost: modelData.cost }]
 
         Rectangle {
           anchors.fill: parent
@@ -59,9 +64,12 @@ Column {
           // The first model sits at the bottom of the stack.
           rotation: 180
           Repeater {
-            model: chart.stacked ? column.modelData.segments : [{ model: "", tokens: column.modelData.tokens, cost: column.modelData.cost }]
+            // Counted, not the array itself: a new array would rebuild every row.
+            model: column.slices.length
             Rectangle {
-              required property var modelData
+              required property int index
+              // The row stays put across refreshes; only what it shows changes.
+              readonly property var modelData: column.slices[index] || ({ tokens: 0, cost: 0 })
               width: column.width
               height: column.value > 0 ? parent.height * (chart.useCost ? modelData.cost : modelData.tokens) / column.value : 0
               color: chart.stacked

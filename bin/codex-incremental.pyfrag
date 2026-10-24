@@ -74,5 +74,5 @@ def cached_codex_rpc():
   except (OSError, ValueError):
     previous = {}
   keys = ("limits", "tierLabel", "subscriptionEndsAt", "usageStatusText",
-          "authHelpText", "retryAdvised")
+          "authHelpText", "retryAdvised", "limitsFetchedAtMs")
   return {key: previous[key] for key in keys if key in previous}

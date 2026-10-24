@@ -3,4 +3,41 @@ set -o pipefail
 
 # Omarchy's Claude collector supplies limits, plan, and today's counters; the
 # enricher adds the full daily history and sessions the panel's analytics need.
-/usr/share/omarchy/bin/omarchy-agent-usage-claude "$@" | "${BASH_SOURCE[0]%/*}/claude-session-enricher" "$@"
+# The collector is patched the same way codex-collector patches Codex's: a
+# rate-limit-aware limits probe, a --local-only pass that never touches the
+# network, and a short transcript-scan reuse window. Exact source anchors make
+# upstream drift fail loudly instead of silently changing behavior.
+/usr/bin/env PLUGIN_DIR="${BASH_SOURCE[0]%/*}" /usr/bin/python3 -c '
+from pathlib import Path
+import os
+import sys
+
+source = Path("/usr/share/omarchy/bin/omarchy-agent-usage-claude").read_text()
+replacements = [
+  (
+    "def main() -> int:\n",
+    (Path(os.environ["PLUGIN_DIR"]) / "claude-limits.pyfrag").read_text() + "\n\ndef main() -> int:\n",
+  ),
+  (
+    "  parser.add_argument(\"--cache-seconds\", type=float, default=20)\n",
+    "  parser.add_argument(\"--cache-seconds\", type=float, default=3)\n"
+    "  parser.add_argument(\"--local-only\", action=\"store_true\")\n",
+  ),
+  (
+    "  limits = collect_limits(access_token, expires_at_ms, args.force)\n",
+    "  limits = collect_limits(access_token, expires_at_ms, args.force, args.local_only)\n",
+  ),
+  (
+    "  if limits.get(\"retryAdvised\"):\n    record[\"retryAdvised\"] = True\n",
+    "  if limits.get(\"retryAdvised\"):\n    record[\"retryAdvised\"] = True\n"
+    "  for key in (\"limitsFetchedAtMs\", \"limitsStale\", \"limitsNote\", \"limitsRetryAtMs\"):\n"
+    "    if key in limits:\n"
+    "      record[key] = limits[key]\n",
+  ),
+]
+for old, new in replacements:
+  if old not in source:
+    raise SystemExit("claude-collector: packaged collector changed; patch anchor missing")
+  source = source.replace(old, new, 1)
+sys.stdout.write(source)
+' | /usr/bin/python3 - "$@" | "${BASH_SOURCE[0]%/*}/claude-session-enricher" "$@" | "${BASH_SOURCE[0]%/*}/account-pool" claude "$@"

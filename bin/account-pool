@@ -1,0 +1,570 @@
+#!/usr/bin/python3
+"""Attach a CPAMC account pool to an agent's usage record.
+
+CPAMC (CLIProxyAPI) can hold many accounts per provider and route an agent's
+traffic across all of them. When it holds accounts for this agent, each one's
+own limits are fetched (in parallel, read-only, with the access token CPAMC
+already stores) and attached to the record as `pool`. The panel then shows
+the pool instead of the single signed-in account whenever the agent is
+actually routed through CPAMC.
+
+Tokens are only ever read. This never refreshes, rewrites or copies a CPAMC
+credential: refresh tokens rotate, and a second writer breaks them.
+
+Usage: account-pool <codex|claude> [--force] [--local-only]   (record on stdin)
+Any failure passes the record through untouched.
+"""
+
+import concurrent.futures
+import json
+import os
+import re
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "omarchy" / "agent-usage"
+STALE_MARKER = "pool-{}.stale"
+
+# Token use is matched to accounts over this much recent session history.
+ACTIVITY_LOOKBACK_SECONDS = 15 * 60
+# Only the end of a session file can hold recent turns.
+SESSION_TAIL_BYTES = 512 * 1024
+# How far a turn's reset times may sit from an account's and still be it.
+RESET_MATCH_SECONDS = 300
+
+# How long a fetched account stays fresh. Anthropic's usage endpoint answers
+# roughly one probe per account every two minutes, OpenAI's is relaxed.
+MIN_AGE_SECONDS = {"codex": 30, "claude": 150}
+BACKOFF_SECONDS = (60, 120, 240, 300)
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+# CPAMC's Claude files carry no plan, and a plan rarely changes: ask daily.
+PLAN_CHECK_SECONDS = 24 * 3600
+
+
+def now_ms():
+  return round(time.time() * 1000)
+
+
+# ------------------------------------------------------------------ CPAMC
+
+def cpamc_config_path():
+  candidates = [os.environ.get("CPAMC_CONFIG"), HOME / ".config/cliproxyapi/config.yaml",
+                HOME / ".cli-proxy-api/config.yaml"]
+  for candidate in candidates:
+    if candidate and Path(candidate).expanduser().is_file():
+      return Path(candidate).expanduser()
+  return None
+
+
+def yaml_scalar(text, key):
+  # The two values needed sit on their own lines; a YAML parser is not worth
+  # a dependency for them.
+  match = re.search(rf"^\s*{re.escape(key)}:\s*[\"']?([^\"'#\n]+?)[\"']?\s*(#.*)?$", text, re.M)
+  return match.group(1).strip() if match else ""
+
+
+def cpamc():
+  path = cpamc_config_path()
+  if not path:
+    return None
+  text = path.read_text(errors="replace")
+  server = text.split("server:", 1)[1] if "server:" in text else text
+  port = yaml_scalar(server, "port") or "8317"
+  auth_dir = yaml_scalar(text, "auth-dir") or "~/.cli-proxy-api"
+  return {"port": port, "authDir": Path(os.path.expandvars(auth_dir)).expanduser()}
+
+
+def load_accounts(auth_dir, provider):
+  accounts = []
+  for path in sorted(auth_dir.glob("*.json")):
+    try:
+      data = json.loads(path.read_text())
+    except (OSError, ValueError):
+      continue
+    if not isinstance(data, dict) or data.get("type") != provider:
+      continue
+    try:
+      priority = int(data.get("priority") or 0)
+    except (TypeError, ValueError):
+      priority = 0
+    accounts.append({
+      "id": path.stem,
+      "email": str(data.get("email") or path.stem),
+      "plan": str(data.get("plan_type") or "").lower(),
+      "priority": priority,
+      "disabled": data.get("disabled") is True,
+      "_token": str(data.get("access_token") or ""),
+      "_accountId": str(data.get("account_id") or ""),
+    })
+  return accounts
+
+
+def routed(provider, port):
+  """Whether the agent's own config sends its traffic through CPAMC."""
+  local = re.compile(rf"//(127\.0\.0\.1|localhost|\[::1\]):{re.escape(port)}(/|$)")
+  if provider == "codex":
+    home = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
+    try:
+      config = tomllib.loads((home / "config.toml").read_text())
+    except (OSError, ValueError):
+      return False
+    name = config.get("model_provider")
+    entry = (config.get("model_providers") or {}).get(name) if name else None
+    return bool(entry and local.search(str(entry.get("base_url") or "")))
+  if provider == "claude":
+    url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    if not url:
+      home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+      try:
+        url = str(json.loads((home / "settings.json").read_text()).get("env", {}).get("ANTHROPIC_BASE_URL") or "")
+      except (OSError, ValueError, AttributeError):
+        url = ""
+    return bool(local.search(url))
+  return False
+
+
+# ------------------------------------------------------------------ fetch
+
+def iso_in(seconds):
+  return datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat()
+
+
+def window(label, length, percent, reset_in, reset_at=None):
+  percent = max(0.0, float(percent))
+  return {"label": label, "lengthSec": int(length), "percent": round(percent, 4),
+          "resetsAt": iso_in(reset_in),
+          # The provider's own reset instant, when it gives one: it is what
+          # identifies the account in Codex's session logs.
+          **({"resetsAtEpoch": int(reset_at)} if reset_at else {}),
+          # A window only starts ticking on first use; before that the
+          # provider reports a full-length countdown and nothing used.
+          "started": percent > 0 or (length - reset_in) > 120}
+
+
+def codex_label(length):
+  if length <= 6 * 3600:
+    return f"{max(1, round(length / 3600))}h"
+  return "Weekly" if length <= 8 * 86400 else f"{round(length / 86400)}-day"
+
+
+def http_get(url, headers):
+  request = urllib.request.Request(url, headers=headers)
+  with urllib.request.urlopen(request, timeout=12) as response:
+    return json.load(response)
+
+
+def fetch_codex(account):
+  data = http_get(CODEX_USAGE_URL, {
+    "Authorization": "Bearer " + account["_token"],
+    "ChatGPT-Account-Id": account["_accountId"],
+    "User-Agent": "codex_cli_rs/0.163.0",
+  })
+  limit = data.get("rate_limit") or {}
+  windows = []
+  for key in ("primary_window", "secondary_window"):
+    w = limit.get(key)
+    if isinstance(w, dict):
+      try:
+        length = int(w["limit_window_seconds"])
+        windows.append(window(codex_label(length), length, float(w["used_percent"]) / 100,
+                              int(w["reset_after_seconds"]), w.get("reset_at")))
+      except (KeyError, TypeError, ValueError):
+        pass
+  limited = limit.get("limit_reached") is True or limit.get("allowed") is False
+  return {"windows": windows, "limited": limited, "plan": str(data.get("plan_type") or "").lower()}
+
+
+def fetch_claude(account):
+  data = http_get(CLAUDE_USAGE_URL, {
+    "Authorization": "Bearer " + account["_token"],
+    "anthropic-beta": "oauth-2025-04-20",
+    "Accept": "application/json",
+  })
+  buckets = [("5h", 5 * 3600, data.get("five_hour")),
+             ("Weekly", 7 * 86400, data.get("seven_day_oauth_apps") or data.get("seven_day"))]
+  raw = [b.get("utilization") for _, _, b in buckets if isinstance(b, dict)]
+  # The endpoint reports 37.0 for 37%; older payloads used 0.37.
+  scale = 100 if any(isinstance(v, (int, float)) and v > 1 for v in raw) else 1
+  windows = []
+  for label, length, bucket in buckets:
+    if not isinstance(bucket, dict) or bucket.get("utilization") is None:
+      continue
+    try:
+      reset_at = datetime.fromisoformat(str(bucket.get("resets_at")).replace("Z", "+00:00")).timestamp()
+      reset_in = max(0, reset_at - time.time())
+    except (TypeError, ValueError):
+      reset_in = length
+    windows.append(window(label, length, float(bucket["utilization"]) / scale, reset_in))
+  return {"windows": windows, "limited": any(w["percent"] >= 1 for w in windows), "plan": ""}
+
+
+def claude_plan(account):
+  """"pro", "max 5x", "max 20x", "team"… from the account's OAuth profile."""
+  data = http_get(CLAUDE_PROFILE_URL, {
+    "Authorization": "Bearer " + account["_token"],
+    "anthropic-beta": "oauth-2025-04-20",
+    "Accept": "application/json",
+  })
+  org = data.get("organization") or {}
+  kind = str(org.get("organization_type") or "").replace("claude_", "")
+  multiple = re.search(r"(\d+x)", str(org.get("rate_limit_tier") or ""))
+  if kind == "max" and multiple:
+    return "max " + multiple.group(1)
+  if not kind:
+    account_info = data.get("account") or {}
+    kind = "max" if account_info.get("has_claude_max") else "pro" if account_info.get("has_claude_pro") else ""
+  return kind
+
+
+FETCHERS = {"codex": fetch_codex, "claude": fetch_claude}
+
+
+def reset_epoch(w):
+  if w.get("resetsAtEpoch"):
+    return float(w["resetsAtEpoch"])
+  try:
+    return datetime.fromisoformat(w["resetsAt"]).timestamp()
+  except (KeyError, TypeError, ValueError):
+    return 0
+
+
+def last_active_ms(previous, windows):
+  """When this account last did real work, as far as its limits can tell.
+
+  Usage only moves in whole percents, so "used more than at the last check"
+  is the signal. A window that merely started (a kick costs ~0%) is not use.
+  """
+  last = int(previous.get("lastActiveMs") or 0)
+  before = {w.get("lengthSec"): w for w in previous.get("windows") or []}
+  for w in windows:
+    old = before.get(w["lengthSec"])
+    if old is None:
+      continue
+    same_period = abs(reset_epoch(w) - reset_epoch(old)) < 180
+    if same_period and w["percent"] > float(old.get("percent") or 0) + 1e-9:
+      last = now_ms()
+    elif not same_period and reset_epoch(w) > reset_epoch(old) and w["percent"] > 0:
+      last = now_ms()  # a new period that already has use in it
+  if not before:
+    # First sight: a window that started a few minutes ago and already shows
+    # use was in use from its start.
+    for w in windows:
+      elapsed = w["lengthSec"] - max(0, reset_epoch(w) - time.time())
+      if w["started"] and w["percent"] > 0 and elapsed < 15 * 60:
+        last = max(last, now_ms() - round(elapsed * 1000))
+  return last
+
+
+# ------------------------------------------------------------ token use
+#
+# Codex logs a token_count event after every turn: when, how many tokens,
+# and the rate limits of the account that served it — whose reset instants
+# are that account's fingerprint. Matching them to the pool's accounts gives
+# real per-account token use, read locally; the proxy stays untouched.
+
+def recent_files(roots, since):
+  stack = list(roots)
+  while stack:
+    try:
+      entries = list(os.scandir(stack.pop()))
+    except OSError:
+      continue
+    for entry in entries:
+      try:
+        if entry.is_dir(follow_symlinks=False):
+          stack.append(entry.path)
+        elif entry.name.endswith(".jsonl") and entry.stat().st_mtime >= since:
+          yield entry.path
+      except OSError:
+        continue
+
+
+def codex_turns(since):
+  """(epoch, tokens, primary reset, secondary reset) for each recent turn."""
+  home = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
+  for path in recent_files([home / "sessions", home / "archived_sessions"], since):
+    for line in tail_lines(path):
+      if '"token_count"' not in line:
+        continue
+      try:
+        event = json.loads(line)
+        payload = event["payload"]
+        at = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
+      except (ValueError, KeyError, TypeError, AttributeError):
+        continue
+      if at < since:
+        continue
+      limits = payload.get("rate_limits") or {}
+      usage = ((payload.get("info") or {}).get("last_token_usage") or {})
+      tokens = int(usage.get("total_tokens") or 0)
+      if tokens <= 0:
+        continue
+      yield (at, tokens, (limits.get("primary") or {}).get("resets_at"),
+             (limits.get("secondary") or {}).get("resets_at"))
+
+
+def tail_lines(path):
+  try:
+    with open(path, "rb") as handle:
+      size = handle.seek(0, os.SEEK_END)
+      handle.seek(max(0, size - SESSION_TAIL_BYTES))
+      lines = handle.read().decode("utf-8", "replace").split("\n")
+  except OSError:
+    return []
+  return lines[1:] if size > SESSION_TAIL_BYTES else lines
+
+
+def claude_turns(since):
+  """(epoch, tokens) for each recent Claude Code reply. Transcripts don't say
+  which account served a reply, so these only attribute to a lone account."""
+  home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+  seen = set()
+  for path in recent_files([home / "projects"], since):
+    for line in tail_lines(path):
+      if '"usage"' not in line or '"assistant"' not in line:
+        continue
+      try:
+        event = json.loads(line)
+        message = event["message"]
+        usage = message["usage"]
+        at = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
+      except (ValueError, KeyError, TypeError, AttributeError):
+        continue
+      # One reply is written once per content block, each with its usage.
+      key = message.get("id") or event.get("requestId") or event.get("uuid")
+      if at < since or key in seen:
+        continue
+      seen.add(key)
+      tokens = sum(int(usage.get(k) or 0) for k in
+                   ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+      if tokens > 0:
+        yield at, tokens
+
+
+def match_account(accounts_resets, primary, secondary):
+  """The account whose reset instants a turn carries, or None if unsure."""
+  best, best_gap = None, RESET_MATCH_SECONDS
+  for account_id, resets in accounts_resets.items():
+    gaps = [abs(float(mark) - r) for mark in (secondary, primary) if mark for r in resets]
+    gap = min(gaps) if gaps else None
+    if gap is not None and gap < best_gap:
+      best, best_gap = account_id, gap
+    elif gap is not None and gap == best_gap:
+      best = None  # two accounts fit equally: don't guess
+  return best
+
+
+def add_turn(activity, account_id, at, tokens):
+  entry = activity.setdefault(account_id, {"lastMs": 0, "minutes": {}})
+  entry["lastMs"] = max(entry["lastMs"], round(at * 1000))
+  minute = int(at // 60) * 60000
+  entry["minutes"][minute] = entry["minutes"].get(minute, 0) + tokens
+
+
+def token_activity(provider, accounts, cache, is_routed):
+  """account id -> {"lastMs", "minutes": {minute epoch ms: tokens}}."""
+  since = time.time() - ACTIVITY_LOOKBACK_SECONDS
+  if provider == "claude":
+    # Routed through CPAMC with a single account to serve it, every local
+    # Claude Code reply came from that account. With several, transcripts
+    # can't tell them apart and the usage percent is the signal instead.
+    serving = [a for a in accounts if not a["disabled"] and a["_token"]]
+    activity = {}
+    if is_routed and len(serving) == 1:
+      for at, tokens in claude_turns(since):
+        add_turn(activity, serving[0]["id"], at, tokens)
+    return activity
+  resets = {}
+  for account in accounts:
+    windows = (cache.get(account["id"]) or {}).get("windows") or []
+    marks = [reset_epoch(w) for w in windows if w.get("started")]
+    if marks:
+      resets[account["id"]] = marks
+  activity = {}
+  if not resets:
+    return activity
+  for at, tokens, primary, secondary in codex_turns(since):
+    account_id = match_account(resets, primary, secondary)
+    if account_id:
+      add_turn(activity, account_id, at, tokens)
+  return activity
+
+
+def plan_state(provider, account, previous):
+  """The account's plan and when it was checked; Claude's is looked up."""
+  plan, checked = previous.get("plan") or "", int(previous.get("planCheckedAtMs") or 0)
+  if provider == "claude" and now_ms() - checked > PLAN_CHECK_SECONDS * 1000:
+    try:
+      plan, checked = claude_plan(account) or plan, now_ms()
+    except Exception:
+      pass  # a label only; try again next pass
+  return {"plan": plan, "planCheckedAtMs": checked}
+
+
+def probe(provider, account, previous, shared=None):
+  """One account's fresh state, or its previous state marked with why not."""
+  plan = plan_state(provider, account, previous)
+  previous = {**previous, **plan}
+  result = {"fetchedAtMs": now_ms(), **plan}
+  if shared is not None:
+    # The agent's own collector just read this very account; asking the
+    # provider again would only spend its rate limit.
+    state = {**result, "status": "limited" if any(w["percent"] >= 1 for w in shared["windows"]) else "ok",
+             "windows": shared["windows"], "fetchedAtMs": shared["fetchedAtMs"],
+             "lastActiveMs": last_active_ms(previous, shared["windows"])}
+    if shared["stale"]:
+      state.update(stale=True, note=shared["note"] or "stale")
+    return state
+  try:
+    fresh = FETCHERS[provider](account)
+  except urllib.error.HTTPError as error:
+    if error.code in (401, 403):
+      return {**result, "status": "expired", "note": "CPAMC's login for this account is no longer valid. Sign it in again in CPAMC."}
+    count = int((previous.get("failure") or {}).get("count") or 0) + 1
+    delay = BACKOFF_SECONDS[min(count, len(BACKOFF_SECONDS)) - 1]
+    note = "rate-limited" if error.code == 429 else f"HTTP {error.code}"
+    return {**previous, "stale": True, "note": note,
+            "failure": {"count": count, "retryAtMs": now_ms() + delay * 1000}}
+  except Exception as error:
+    return {**previous, "stale": True, "note": f"offline ({type(error).__name__})"}
+  status = "limited" if fresh["limited"] else "ok"
+  return {**result, "status": status, "windows": fresh["windows"], "plan": fresh["plan"] or plan["plan"],
+          "lastActiveMs": last_active_ms(previous, fresh["windows"])}
+
+
+def shared_limits(provider, record):
+  """The signed-in account's limits from the agent's own collector, as pool
+  windows: {"email", "windows", "fetchedAtMs"}, or None."""
+  # Stale or not, these are the freshest numbers this account will get: the
+  # collector already paces its checks to the endpoint's budget.
+  if provider != "claude" or not record.get("limitsFetchedAtMs"):
+    return None
+  email = str(record.get("accountLabel") or "").lower()
+  windows = []
+  for limit in record.get("limits") or []:
+    label = str(limit.get("label") or "").lower()
+    length = 5 * 3600 if "5-hour" in label or "session" in label else 7 * 86400 if "7-day" in label or "week" in label else 0
+    try:
+      reset_at = datetime.fromisoformat(str(limit["resetsAt"])).timestamp()
+      percent = float(limit["percent"])
+    except (KeyError, TypeError, ValueError):
+      continue
+    if length and not any(w["lengthSec"] == length for w in windows):
+      windows.append(window("5h" if length < 86400 else "Weekly", length, percent,
+                            max(0, reset_at - time.time()), reset_at))
+  if not email or not windows:
+    return None
+  return {"email": email, "windows": windows, "fetchedAtMs": int(record["limitsFetchedAtMs"]),
+          "stale": record.get("limitsStale") is True, "note": str(record.get("limitsNote") or "")}
+
+
+# ------------------------------------------------------------------ main
+
+def build_pool(provider, force, local_only, record=None):
+  config = cpamc()
+  if not config or not config["authDir"].is_dir():
+    return None
+  accounts = load_accounts(config["authDir"], provider)
+  if not accounts:
+    return None
+
+  CACHE_DIR.mkdir(parents=True, exist_ok=True)
+  cache_path = CACHE_DIR / f"pool-{provider}-v1.json"
+  marker = CACHE_DIR / STALE_MARKER.format(provider)
+  try:
+    cache = json.loads(cache_path.read_text())
+  except (OSError, ValueError):
+    cache = {}
+  if marker.exists():
+    # Something changed an account on purpose (a kick): look again now.
+    force = True
+    marker.unlink(missing_ok=True)
+
+  min_age = MIN_AGE_SECONDS.get(provider, 60) * 1000
+  due = []
+  for account in accounts:
+    previous = cache.get(account["id"]) or {}
+    retry_at = int((previous.get("failure") or {}).get("retryAtMs") or 0)
+    age = now_ms() - int(previous.get("fetchedAtMs") or 0)
+    if account["disabled"] or not account["_token"] or local_only or now_ms() < retry_at:
+      continue
+    if force or age >= min_age or previous.get("stale"):
+      due.append(account)
+
+  shared = shared_limits(provider, record or {})
+  def own(account):
+    return shared if shared and account["email"].lower() == shared["email"] else None
+
+  if due:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(due))) as pool:
+      states = pool.map(lambda a: probe(provider, a, cache.get(a["id"]) or {}, own(a)), due)
+      for account, state in zip(due, states):
+        cache[account["id"]] = state
+    known = {a["id"] for a in accounts}
+    tmp = cache_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({k: v for k, v in cache.items() if k in known}))
+    tmp.replace(cache_path)
+
+  is_routed = routed(provider, config["port"])
+  activity = token_activity(provider, accounts, cache, is_routed)
+
+  out = []
+  for account in accounts:
+    state = cache.get(account["id"]) or {}
+    used = activity.get(account["id"]) or {}
+    entry = {k: v for k, v in account.items() if not k.startswith("_")}
+    entry["plan"] = state.get("plan") or account["plan"]
+    entry["windows"] = state.get("windows") or []
+    entry["fetchedAtMs"] = int(state.get("fetchedAtMs") or 0)
+    # Logged tokens are the real signal; a rising percent covers clients
+    # that don't write Codex session logs.
+    entry["lastActiveMs"] = max(int(state.get("lastActiveMs") or 0), int(used.get("lastMs") or 0))
+    entry["recentTokens"] = [[minute, tokens] for minute, tokens in sorted((used.get("minutes") or {}).items())]
+    if account["disabled"]:
+      entry["status"] = "disabled"
+    elif not account["_token"]:
+      entry["status"], entry["note"] = "expired", "No access token in CPAMC's file. Sign the account in again."
+    else:
+      entry["status"] = state.get("status") or "unknown"
+      if state.get("note"):
+        entry["note"] = state["note"]
+      if state.get("stale"):
+        entry["stale"] = True
+    out.append(entry)
+
+  return {
+    "source": "cpamc",
+    "endpoint": f"127.0.0.1:{config['port']}",
+    "routed": is_routed,
+    "fetchedAtMs": max([a["fetchedAtMs"] for a in out] + [0]),
+    "accounts": out,
+  }
+
+
+def main():
+  args = sys.argv[1:]
+  provider = args[0] if args and not args[0].startswith("-") else ""
+  raw = sys.stdin.read()
+  try:
+    record = json.loads(raw)
+    if provider in FETCHERS:
+      pool = build_pool(provider, "--force" in args, "--local-only" in args, record)
+      if pool:
+        record["pool"] = pool
+  except Exception as error:
+    print(f"account-pool: {error}", file=sys.stderr)
+    sys.stdout.write(raw)
+    return
+  json.dump(record, sys.stdout, separators=(",", ":"))
+  sys.stdout.write("\n")
+
+
+main()

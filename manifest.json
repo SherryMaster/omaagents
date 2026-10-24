@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.sherrymaster.omaagents",
   "name": "OmaAgents",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "author": "SherryMaster",
   "license": "MIT",
-  "description": "AI coding agent usage for the Omarchy bar: Claude Code, Codex and Fireworks limits with pace, today's tokens and API-equivalent cost at a glance, and a details report with models, sessions, cache and cost mix for any period.",
+  "description": "AI coding agent usage for the Omarchy bar: Claude Code, Codex and Fireworks limits with pace, today's tokens and API-equivalent cost at a glance, and a details report with models, sessions, cache and cost mix for any period, plus CPAMC account pools: pooled limits, per-account windows and kicks.",
   "kinds": [
     "bar-widget"
   ],
@@ -41,7 +41,8 @@
       "syncFileName": "",
       "syncDeviceId": "",
       "glancePeriod": "Today",
-      "showAccount": true
+      "showAccount": true,
+      "inUseMinutes": 3
     },
     "schema": [
       {
@@ -65,9 +66,19 @@
         "description": "Turn off to keep the email out of screen shares."
       },
       {
+        "key": "inUseMinutes",
+        "type": "integer",
+        "label": "\"In use\" window (minutes)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 3,
+        "description": "A pooled account reads as in use while it served tokens within this many minutes; otherwise it reads as idle."
+      },
+      {
         "key": "refreshIntervalSec",
         "type": "integer",
-        "label": "Full refresh interval (seconds)",
+        "label": "Billing refresh interval (seconds)",
         "min": 60,
         "max": 3600,
         "step": 60,
@@ -76,7 +87,7 @@
       {
         "key": "fastIntervalSec",
         "type": "integer",
-        "label": "Codex local refresh (seconds)",
+        "label": "Local usage refresh while open (seconds)",
         "min": 2,
         "max": 30,
         "step": 1,

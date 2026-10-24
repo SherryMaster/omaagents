@@ -86,9 +86,12 @@ Column {
     leftPadding: Style.space(14)
     spacing: Style.space(2)
     Repeater {
-      model: session.row ? session.row.models : []
+      // Counted, not the array itself: a new array would rebuild every row.
+      model: (session.row && session.row.models || []).length
       Text {
-        required property var modelData
+        required property int index
+        // The row stays put across refreshes; only what it shows changes.
+        readonly property var modelData: (session.row && session.row.models || [])[index] || ({})
         width: session.width - Style.space(14)
         text: session.nameFor(modelData.id) + " — " + A.formatTokens(modelData.tokens)
           + (modelData.cost >= 0 ? " · " + A.formatMoney(modelData.cost) : "")

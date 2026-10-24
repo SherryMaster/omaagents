@@ -37,6 +37,8 @@ Panel {
   property string customStart: ""
   property string customEnd: ""
   property string expandedSessionId: ""
+  property var kickSelection: ({})
+  property var expandedTiers: ({})
 
   // Countdowns and "today" read this clock, so a panel left open keeps
   // telling the truth, across midnight too.
@@ -51,6 +53,7 @@ Panel {
     return ["today", "7d", "30d", "cycle"].indexOf(value) >= 0 ? value : "today"
   }
   readonly property bool showAccount: setting("showAccount", true) !== false
+  readonly property real inUseMs: Math.max(1, Number(setting("inUseMinutes", 3)) || 3) * 60000
 
   property var publishedPricing: ({})
   FileView {
@@ -72,8 +75,13 @@ Panel {
       if (windows[i].title === "Session" && !session) session = windows[i]
       if (windows[i].title === "Weekly" && !weekly) weekly = windows[i]
     }
-    return [session, weekly].filter(function(w) { return w !== null })
+    var picked = [session, weekly].filter(function(w) { return w !== null })
+    // A pool of monthly-window accounts (Free only) has neither; show its own.
+    return picked.length ? picked : windows.slice(0, 2)
   }
+
+  // What the bar prints: the limits, or one dash when there are none.
+  readonly property var barSlots: barLimits.length ? barLimits : [{ percent: -1 }]
 
   function usageColor(value) {
     if (!isFinite(value) || value < 0) return root.foreground
@@ -90,12 +98,38 @@ Panel {
     var wrapped = ((index % providers.length) + providers.length) % providers.length
     selectedProviderId = providers[wrapped].providerId
     expandedSessionId = ""
+    kickSelection = ({})
   }
 
+  // Kicks the selected idle accounts, or every idle one when none is picked.
+  // Only accounts the panel shows as idle are ever sent.
+  function kickAccounts() {
+    if (!provider || provider.providerId !== "codex" || !provider.pool || !kicker.ready || kicker.running) return
+    var idle = A.poolSummary(provider.pool, Date.now(), inUseMs).kickable
+    var chosen = idle.filter(function(a) { return root.kickSelection[a.id] === true })
+    if (chosen.length === 0) chosen = idle
+    if (chosen.length === 0) return
+    kicker.kick(chosen.map(function(a) { return a.email }), chosen.map(function(a) { return a.id }))
+    kickSelection = ({})
+  }
+
+  function toggleKickSelection(id) {
+    var next = Object.assign({}, kickSelection)
+    if (next[id]) delete next[id]
+    else next[id] = true
+    kickSelection = next
+  }
+
+  // Background passes run all the time; only a refresh someone asked for
+  // is worth a "Refreshing…" line.
+  property double manualRefreshAtMs: 0
   function refreshNow() {
     nowMs = Date.now()
+    manualRefreshAtMs = nowMs
     usage.refreshProvider(provider ? provider.providerId : "")
   }
+
+  readonly property bool refreshing: provider ? usage.isRefreshing(provider.providerId) : false
 
   function showDetails() {
     page = "details"
@@ -138,7 +172,7 @@ Panel {
   onOpenedChanged: {
     if (opened) {
       nowMs = Date.now()
-      usage.refreshLimits()
+      kicker.probe()
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     } else {
       page = "glance"
@@ -149,6 +183,13 @@ Panel {
   Main {
     id: usage
     settings: root.settings
+    panelOpen: root.opened
+  }
+
+  // Lives outside the popup so a kick finishes even if the panel closes.
+  KickRunner {
+    id: kicker
+    onKicked: usage.refreshProvider("codex")
   }
 
   Timer {
@@ -168,6 +209,7 @@ Panel {
     function refresh(): string { root.refreshNow(); return "ok" }
     function next(): string { root.selectProvider(root.providerIndex + 1); return "ok" }
     function details(): void { root.open(); root.showDetails() }
+    function kick(): string { root.kickAccounts(); return kicker.ready ? "ok" : kicker.unavailableReason }
   }
 
   WidgetButton {
@@ -179,11 +221,23 @@ Panel {
     fixedWidth: barContent.implicitWidth + Style.space(8)
     tooltipText: {
       var lines = [root.provider ? root.provider.providerName : "Agents"]
+      var pool = root.provider && root.provider.pooled ? A.poolSummary(root.provider.pool, Date.now(), root.inUseMs) : null
+      if (pool) lines[0] += pool.single ? " · via CPAMC" : " · pool of " + pool.total + " via CPAMC"
       for (var i = 0; i < root.barLimits.length; i++)
-        lines.push(root.barLimits[i].title + ": " + Math.round(root.barLimits[i].percent * 100) + "% used")
+        lines.push(root.barLimits[i].title + ": " + Math.round(root.barLimits[i].percent * 100) + "% used"
+          + (root.barLimits[i].pool ? " (" + A.poolDetail(root.barLimits[i], Date.now()).split(" · ")[0] + ")" : ""))
+      if (pool) {
+        for (var t = 1; t < pool.tiers.length; t++)
+          lines.push("Overflow: " + pool.tiers[t].open + "/" + pool.tiers[t].total + " " + pool.tiers[t].label + " open")
+        var busy = pool.accounts.filter(function(a) { return a.status === "running" }).length
+        if (!pool.single) lines.push(busy + " in use now")
+        if (pool.kickable.length) lines.push(pool.kickable.length + " not started — kick from the panel (Shift+K)")
+      }
       if (!root.barLimits.length) lines.push("Limits unavailable")
-      if (usage.refreshing) lines.push("Refreshing usage…")
-      if (usage.refreshFailed || (root.provider && root.provider.limitsStale))
+      if (root.refreshing && Date.now() - root.manualRefreshAtMs < 20000) lines.push("Refreshing usage…")
+      var freshness = A.limitsFreshness(root.provider, Date.now())
+      if (freshness !== "") lines.push(freshness)
+      else if (root.provider && (root.provider.limitsStale || usage.refreshFailed(root.provider.providerId)))
         lines.push("Refresh failed — showing last known limits (stale)")
       if (root.provider && root.provider.usageStatusText) lines.push(root.provider.usageStatusText)
       lines.push("Left-click: open · Right-click: refresh")
@@ -209,9 +263,11 @@ Panel {
         fontFamily: root.fontFamily
       }
       Repeater {
-        model: root.barLimits.length ? root.barLimits : [{ percent: -1 }]
+        // Counted, not the array itself: a new array would rebuild every row.
+        model: root.barSlots.length
         delegate: Row {
-          required property var modelData
+          // The row stays put across refreshes; only what it shows changes.
+          readonly property var modelData: root.barSlots[index] || ({ percent: -1 })
           required property int index
           spacing: Style.space(5)
           Text {
@@ -256,6 +312,8 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refreshNow()
+        // Plain k scrolls (the shell's vim keys), so the kick is Shift+K.
+        else if (t === "K" && root.page === "glance") root.kickAccounts()
         else if (root.page === "details" && (t === "\b" || t === "\x7f")) root.showGlance()
         else if (root.page === "details" && t >= "1" && t <= "9" && Number(t) <= details.pills.length)
           root.pickPeriod(details.pills[Number(t) - 1].kind)
@@ -304,16 +362,26 @@ Panel {
             nowMs: root.nowMs
             glancePeriod: root.glancePeriod
             showAccount: root.showAccount
-            refreshing: usage.refreshing
+            inUseMs: root.inUseMs
             fallbackGlyph: button.text
             footer: usage.syncStatusText
             surface: root.surface
             foreground: root.foreground
             fontFamily: root.fontFamily
             friendlyModelName: usage.friendlyModelName
+            kicker: kicker
+            kickSelection: root.kickSelection
+            expandedTiers: root.expandedTiers
             onProviderPicked: function(index) { root.selectProvider(index) }
-            onRefreshRequested: root.refreshNow()
             onDetailsRequested: root.showDetails()
+            onAccountToggled: function(id) { root.toggleKickSelection(id) }
+            onKickRequested: root.kickAccounts()
+            onKickSelectionCleared: root.kickSelection = ({})
+            onTierToggled: function(priority, expanded) {
+              var next = Object.assign({}, root.expandedTiers)
+              next[priority] = expanded
+              root.expandedTiers = next
+            }
           }
 
           DetailsView {
@@ -330,7 +398,6 @@ Panel {
             customStart: root.customStart
             customEnd: root.customEnd
             expandedSessionId: root.expandedSessionId
-            refreshing: usage.refreshing
             foreground: root.foreground
             fontFamily: root.fontFamily
             friendlyModelName: usage.friendlyModelName
@@ -343,7 +410,6 @@ Panel {
               keyCatcher.forceActiveFocus()
             }
             onSessionToggled: function(id) { root.expandedSessionId = root.expandedSessionId === id ? "" : id }
-            onRefreshRequested: root.refreshNow()
           }
         }
       }

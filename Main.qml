@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import "Analytics.js" as A
 
 // The display side of agent usage. All extraction lives behind
 // omarchy-agent-usage-update, which writes one JSON record per agent into
@@ -18,6 +19,8 @@ Item {
   // ------------------------------------------------------------- discovery
 
   property var agentIds: []
+  // Until the first listing lands, discovery would rerun every known agent.
+  property bool listed: false
   property var agents: []
   property int dataRevision: 0
   property double previousCodexTokens: -1
@@ -50,6 +53,7 @@ Item {
     // Same list, same objects: reassigning the model would tear down every
     // FileView just to build identical ones.
     if (JSON.stringify(ids) !== JSON.stringify(agentIds)) agentIds = ids
+    listed = true
   }
 
   Instantiator {
@@ -60,6 +64,7 @@ Item {
       required property var modelData
       agentId: modelData
       path: root.usageDir + "/" + modelData + ".json"
+      updatePath: root.updatePath
       onRecordChanged: root.recordsChanged()
     }
 
@@ -89,35 +94,7 @@ Item {
       codexActive = Date.now() - lastCodexActivityMs < 120000
       break
     }
-    scheduleLimitsRetry()
     scheduleSync()
-  }
-
-  // A collector that could not reach its limits endpoint at all — typically
-  // the seconds after login before the network is up — writes retryAdvised
-  // into its record. Honor it with one sooner try instead of waiting out the
-  // full refresh interval; a run that reaches the endpoint clears the flag.
-  // Only the advising agents rerun, so an outage at one provider does not
-  // put every other collector on a 30-second treadmill.
-  property var retryAgentIds: []
-
-  Timer {
-    id: limitsRetry
-    interval: 30000
-    repeat: false
-    onTriggered: root.runUpdate("limits", root.retryAgentIds)
-  }
-
-  function scheduleLimitsRetry() {
-    var advising = []
-    for (var i = 0; i < agents.length; i++) {
-      var record = agents[i] ? agents[i].record : null
-      if (record && record.retryAdvised === true && providerEnabled(String(record.id || "")))
-        advising.push(String(record.id))
-    }
-    retryAgentIds = advising
-    if (advising.length > 0 && !limitsRetry.running) limitsRetry.start()
-    else limitsRetry.stop()
   }
 
   Component.onCompleted: {
@@ -127,112 +104,112 @@ Item {
 
   // -------------------------------------------------------------- refresh
 
+  // Resolved next to this file, so the plugin works from any install folder.
+  readonly property string updatePath: decodeURIComponent(String(Qt.resolvedUrl("bin/usage-update")).replace(/^[a-z]+:\/\//, ""))
   property int refreshIntervalSec: Math.max(60, Number(setting("refreshIntervalSec", 300)))
   property int fastIntervalSec: Math.max(2, Number(setting("fastIntervalSec", 5)))
-  property string pendingUpdateKind: ""
-  property var pendingAgentIds: null
-  property string activeUpdateKind: ""
-  property bool refreshFailed: false
-  readonly property bool refreshing: updateProcess.running && activeUpdateKind !== "fast"
+  // Set by the panel. Someone looking gets the fast cadence; the bar alone
+  // only needs the limits, so a closed panel stays quiet.
+  property bool panelOpen: false
+  // Agents whose collectors can rescan local files without the network.
+  readonly property var localPassAgents: ["claude", "codex"]
 
+  // Agents with no record yet: a full pass over every collector except the
+  // ones that already have their own lane, so new CLIs still show up.
+  readonly property var discoveryArgs: {
+    var args = []
+    for (var i = 0; i < agentIds.length; i++) args.push("--except", agentIds[i])
+    var providers = settings && settings.providers ? settings.providers : {}
+    for (var id in providers)
+      if (providers[id] && providers[id].enabled === false && agentIds.indexOf(id) < 0) args.push("--except", id)
+    return args
+  }
+
+  UpdateLane {
+    id: discoveryLane
+    updatePath: root.updatePath
+    args: root.discoveryArgs
+    onFinished: root.rescanAgents()
+  }
+
+  // How often each agent's limits are asked for. Anthropic's usage endpoint
+  // answers about one check every two minutes and refuses the rest, so
+  // asking faster only burns the check an opened panel wants; the collector
+  // also backs off on its own after a refusal. Codex's RPC is local and cheap.
+  function normalIntervalSec(agent) {
+    var record = agent.record || {}
+    if (record.retryAdvised === true) return 30
+    if (agent.agentId === "claude") return panelOpen ? 30 : 120
+    if (agent.agentId === "codex") return panelOpen || codexActive ? 15 : 60
+    return refreshIntervalSec
+  }
+
+  // One clock drives every pass: an agent is due when its last run is older
+  // than its interval. Lanes that are busy skip the tick.
   Timer {
-    interval: root.refreshIntervalSec * 1000
+    interval: 1000
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: root.runUpdate("normal")
+    onTriggered: root.tick()
   }
 
-  // Local Codex records can change several times within a minute. The fast
-  // collector reuses cached account limits and scans only changed sessions.
-  Timer {
-    interval: root.fastIntervalSec * 1000
-    running: true
-    repeat: true
-    onTriggered: root.runUpdate("fast", ["codex"])
-  }
-
-  Timer {
-    interval: 30000
-    running: true
-    repeat: true
-    onTriggered: root.runUpdate("normal", ["claude"])
-  }
-
-  Timer {
-    interval: root.codexActive ? 15000 : 60000
-    running: true
-    repeat: true
-    onTriggered: root.runUpdate("limits", ["codex"])
-  }
-
-  Process {
-    id: updateProcess
-    running: false
-    onExited: function(exitCode, exitStatus) {
-      root.refreshFailed = exitCode !== 0 || exitStatus !== 0
-      root.activeUpdateKind = ""
-      root.rescanAgents()
-      if (root.pendingUpdateKind !== "") {
-        var kind = root.pendingUpdateKind
-        var ids = root.pendingAgentIds
-        root.pendingUpdateKind = ""
-        root.pendingAgentIds = null
-        root.runUpdate(kind, ids)
-      }
+  function tick() {
+    var now = Date.now()
+    for (var i = 0; i < agents.length; i++) {
+      var agent = agents[i]
+      if (!agent || !providerEnabled(agent.agentId) || agent.lane.busy) continue
+      if (now - agent.lane.lastNormalStartMs >= normalIntervalSec(agent) * 1000) agent.refresh("normal")
+      else if (panelOpen && localPassAgents.indexOf(agent.agentId) >= 0
+               && now - agent.lane.lastStartMs >= fastIntervalSec * 1000) agent.refresh("fast")
     }
+    if (listed && !discoveryLane.busy && now - discoveryLane.lastNormalStartMs >= refreshIntervalSec * 1000)
+      discoveryLane.request("normal")
+  }
 
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: if (text.trim() !== "") console.warn("agents", text.trim())
+  // Opening the panel asks every agent for fresh numbers on the spot. The
+  // collectors guard their providers themselves (Claude reuses a probe under
+  // 15 seconds old and waits out a rate-limit backoff), so nothing here
+  // needs to second-guess them — except billing APIs, which get a minute.
+  function refreshOnOpen() {
+    var now = Date.now()
+    for (var i = 0; i < agents.length; i++) {
+      var agent = agents[i]
+      if (!agent || !providerEnabled(agent.agentId)) continue
+      var local = localPassAgents.indexOf(agent.agentId) >= 0
+      if (local || now - agent.lane.lastNormalStartMs >= 60000) agent.refresh("normal")
     }
   }
+  onPanelOpenChanged: if (panelOpen) refreshOnOpen()
 
-  function updateCommand(kind, agentIds) {
-    // Resolved next to this file, so the plugin works from any install folder.
-    var command = [decodeURIComponent(String(Qt.resolvedUrl("bin/usage-update")).replace(/^[a-z]+:\/\//, ""))]
-    if (kind === "force") command.push("--force")
-    if (kind === "limits") command.push("--limits-only")
-    if (kind === "fast") command.push("--fast")
-    var providers = settings && settings.providers ? settings.providers : {}
-    for (var id in providers) {
-      if (providers[id] && providers[id].enabled === false) command.push("--except", id)
-    }
-    if (agentIds) {
-      for (var i = 0; i < agentIds.length; i++) command.push(agentIds[i])
-    }
-    return command
+  function agentFor(id) {
+    for (var i = 0; i < agents.length; i++)
+      if (agents[i] && agents[i].agentId === id) return agents[i]
+    return null
   }
 
-  function runUpdate(kind, agentIds) {
-    if (updateProcess.running) {
-      // The short timer skips busy periods. A requested full refresh still
-      // runs as soon as the current collector finishes.
-      if (kind === "fast") return
-      if (kind === "force" || root.pendingUpdateKind === "") {
-        root.pendingUpdateKind = kind
-        root.pendingAgentIds = agentIds || null
-      }
-      return
-    }
-    updateProcess.command = updateCommand(kind, agentIds)
-    activeUpdateKind = kind
-    updateProcess.running = true
-  }
-
-  function refresh() { refreshAll(true) }
-  function refreshAll(force) { runUpdate(force === true ? "force" : "normal") }
   function refreshProvider(id) {
-    if (!id) return refreshAll(false)
-    // Show Codex local changes first, then fetch this account's limits.
-    if (id === "codex") runUpdate("fast", [id])
-    runUpdate("normal", [id])
+    var agent = agentFor(id)
+    if (agent) agent.refresh("normal")
+    else discoveryLane.request("normal")
   }
 
-  // Opening the panel wants the numbers that go stale on the wire, not
-  // another walk over every transcript on disk — the collectors reuse their
-  // recent scans in this mode.
-  function refreshLimits() { runUpdate("limits", ["claude", "codex"]) }
+  function refreshAll(force) {
+    var kind = force === true ? "force" : "normal"
+    for (var i = 0; i < agents.length; i++)
+      if (agents[i] && providerEnabled(agents[i].agentId)) agents[i].refresh(kind)
+    discoveryLane.request(kind)
+  }
+
+  function isRefreshing(id) {
+    var agent = agentFor(id)
+    return agent ? agent.lane.refreshing : discoveryLane.refreshing
+  }
+
+  function refreshFailed(id) {
+    var agent = agentFor(id)
+    return !!agent && agent.lane.failed
+  }
 
   // ------------------------------------------------------------- providers
 
@@ -301,18 +278,30 @@ Item {
     var stats = syncedStatsFor(String(record.id))
     var synced = !!stats
     var deviceCount = synced ? Number(stats.deviceCount || aggregateData.deviceCount || 0) : 0
+    // Routed through CPAMC, the agent spends a whole pool of accounts, so the
+    // pool's numbers replace the signed-in account's everywhere.
+    var pool = record.pool && Array.isArray(record.pool.accounts) && record.pool.accounts.length ? record.pool : null
+    var pooled = !!pool && pool.routed === true
+    var poolStale = pooled && pool.accounts.every(function(a) { return a.stale === true || a.status === "disabled" })
 
     return {
       providerId: String(record.id),
       providerName: String(record.name || record.id),
       ready: record.ready === true || synced,
-      usageStatusText: String(record.usageStatusText || ""),
-      limitsStale: record.limitsStale === true,
-      authHelpText: String(record.authHelpText || ""),
+      // The signed-in account's trouble doesn't stop a pool.
+      usageStatusText: pooled ? "" : String(record.usageStatusText || ""),
+      limitsStale: pooled ? poolStale : record.limitsStale === true,
+      limitsFetchedAtMs: pooled ? numberValue(pool.fetchedAtMs) : numberValue(record.limitsFetchedAtMs),
+      limitsRetryAtMs: pooled ? 0 : numberValue(record.limitsRetryAtMs),
+      limitsNote: pooled ? (poolStale ? "account checks failing" : "") : String(record.limitsNote || ""),
+      authHelpText: pooled ? "" : String(record.authHelpText || ""),
+      pool: pool,
+      pooled: pooled,
 
       // Rate limits and balances stay per-account and are never merged
       // across devices.
-      limits: Array.isArray(record.limits) ? record.limits : [],
+      limits: pooled ? A.poolLimits(pool, Date.now()) : Array.isArray(record.limits) ? record.limits : [],
+      loginLimits: Array.isArray(record.limits) ? record.limits : [],
       tierLabel: String(record.tierLabel || ""),
       subscriptionEndsAt: String(record.subscriptionEndsAt || ""),
       // Local only: the email never travels in synced snapshots.

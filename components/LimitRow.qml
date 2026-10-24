@@ -26,8 +26,21 @@ Column {
       font.pixelSize: Style.font.body
       elide: Text.ElideRight
       anchors.left: parent.left
+      width: Math.min(implicitWidth, percent.x - Style.spacing.sm)
+    }
+    // A pooled window says what it pools ("3 Plus pooled").
+    Text {
+      visible: text !== ""
+      text: row.window && row.window.subtitle ? row.window.subtitle : ""
+      color: row.dim
+      font.family: row.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+      anchors.left: title.right
+      anchors.leftMargin: Style.space(8)
       anchors.right: percent.left
       anchors.rightMargin: Style.spacing.sm
+      anchors.baseline: title.baseline
     }
     Text {
       id: percent

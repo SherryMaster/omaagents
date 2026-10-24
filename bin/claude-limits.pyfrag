@@ -1,0 +1,81 @@
+# Anthropic's usage endpoint rate-limits hard: polled every 30 seconds it
+# answered about one probe in four with numbers and the rest with 429, and
+# the packaged collector then served its cached limits as if they were live.
+# This replacement backs off after a refusal, never probes inside the backoff
+# (not even for --force, which would only stretch it), and tells the panel
+# how old the limits are and whether they are stale. --local-only never
+# probes, so the panel can rescan transcripts every few seconds for free.
+PROBE_BACKOFF_SECONDS = (60, 120, 240, 300)
+
+
+def collect_limits(access_token, expires_at_ms, force, local_only=False):
+  result = {"limits": [], "usageStatusText": "", "authHelpText": AUTH_HELP}
+  probe_cache = cache_root() / "claude-limits.json"
+  cached = read_fresh_json(probe_cache, float("inf")) or {}
+  fallback = usable_cached_limits(cached)
+  failure = cached.get("failure") if isinstance(cached.get("failure"), dict) else {}
+  now = time.time()
+  fetched_at = number(cached.get("fetchedAtMs")) / 1000
+  retry_at = number(failure.get("retryAtMs")) / 1000
+
+  def reuse(note):
+    result["limits"] = fallback
+    if fetched_at > 0:
+      result["limitsFetchedAtMs"] = round(fetched_at * 1000)
+    if note and fallback:
+      result["limitsStale"] = True
+      result["limitsNote"] = note
+      if retry_at > now:
+        result["limitsRetryAtMs"] = round(retry_at * 1000)
+    return result
+
+  if access_token == "":
+    result["usageStatusText"] = "Waiting for auth"
+    return reuse("")
+  if expires_at_ms > 0 and expires_at_ms <= now * 1000:
+    result["usageStatusText"] = "Sign-in expired"
+    result["authHelpText"] = (
+      "Claude Code's saved sign-in expired"
+      + (" — showing the last known limits." if fallback else ".")
+      + " Start Claude Code, or run `claude auth login`, to refresh it."
+    )
+    return reuse("")
+
+  last_note = str(failure.get("note") or "")
+  if local_only or now < retry_at:
+    return reuse(last_note)
+  if fallback and not force and now - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
+    return reuse(last_note)
+
+  probe = probe_limits(access_token)
+  if probe["ok"]:
+    write_json(probe_cache, {"fetchedAtMs": round(now * 1000), "limits": probe["limits"]})
+    result["limits"] = probe["limits"]
+    result["limitsFetchedAtMs"] = round(now * 1000)
+    return result
+
+  help_text = str(probe.get("helpText") or "")
+  count = number(failure.get("count")) + 1
+  if probe.get("transport"):
+    # No server answered, so there is nobody to pester: the shell retries
+    # sooner on retryAdvised instead.
+    result["retryAdvised"] = True
+    note, delay = "offline", 0
+  else:
+    # The 429s carry "Retry-After: 0", which is no advice at all, so the
+    # header can only lengthen the schedule, never shorten it.
+    match = re.search(r"retry after (\d+)", help_text)
+    delay = max(int(match.group(1)) if match else 0,
+                PROBE_BACKOFF_SECONDS[min(count, len(PROBE_BACKOFF_SECONDS)) - 1])
+    note = "rate-limited" if "rate limit" in help_text else "check failed"
+  retry_at = now + delay
+  write_json(probe_cache, {
+    "fetchedAtMs": number(cached.get("fetchedAtMs")),
+    "limits": cached.get("limits") if isinstance(cached.get("limits"), list) else [],
+    "failure": {"count": count, "note": note, "retryAtMs": round(retry_at * 1000)},
+  })
+  if fallback:
+    return reuse(note)
+  result["usageStatusText"] = "Claude limits unavailable"
+  result["authHelpText"] = help_text
+  return result

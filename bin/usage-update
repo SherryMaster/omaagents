@@ -57,7 +57,8 @@ for collector in /usr/share/omarchy/bin/omarchy-agent-usage-*; do
   [[ -x $collector ]] || continue
   agent="${collector##*/omarchy-agent-usage-}"
   [[ $agent == "update" ]] && continue
-  if $fast && [[ $agent != codex ]]; then continue; fi
+  # Only these two can rescan locally without asking their provider.
+  if $fast && [[ $agent != codex && $agent != claude ]]; then continue; fi
   wanted "$agent" || continue
   agent_flags=("${flags[@]}")
   if [[ $agent == codex ]]; then
@@ -65,6 +66,7 @@ for collector in /usr/share/omarchy/bin/omarchy-agent-usage-*; do
     if $fast; then agent_flags+=(--local-only); fi
   elif [[ $agent == claude ]]; then
     collector="$PLUGIN_DIR/claude-collector"
+    if $fast; then agent_flags+=(--local-only); fi
   fi
   collect "$collector" "$agent" "${agent_flags[@]}" &
   pids+=($!)

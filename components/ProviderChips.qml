@@ -17,10 +17,12 @@ Row {
   spacing: Style.space(4)
 
   Repeater {
-    model: chips.providers
+    // Counted, not the array itself: a new array would rebuild every row.
+    model: chips.providers.length
     CursorSurface {
       id: chip
-      required property var modelData
+      // The row stays put across refreshes; only what it shows changes.
+      readonly property var modelData: chips.providers[index] || ({})
       required property int index
       width: Style.space(28)
       height: Style.space(28)

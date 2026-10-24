@@ -17,7 +17,6 @@ Column {
   property string customStart: ""
   property string customEnd: ""
   property string expandedSessionId: ""
-  property bool refreshing: false
   property color foreground: Color.foreground
   property string fontFamily: Style.font.family
   property var friendlyModelName: function(id) { return id }
@@ -26,7 +25,6 @@ Column {
   signal stepRequested(int delta)
   signal customChanged(string start, string end)
   signal sessionToggled(string id)
-  signal refreshRequested()
 
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string renewal: provider ? String(provider.subscriptionEndsAt || "") : ""
@@ -72,7 +70,7 @@ Column {
   // ---------- Header
   Item {
     width: parent.width
-    implicitHeight: Math.max(backText.implicitHeight, refresh.height)
+    implicitHeight: backText.implicitHeight
 
     Text {
       id: backText
@@ -96,14 +94,6 @@ Column {
       anchors.left: backText.right
       anchors.baseline: backText.baseline
     }
-    RefreshButton {
-      id: refresh
-      anchors.right: parent.right
-      busy: details.refreshing
-      foreground: details.foreground
-      fontFamily: details.fontFamily
-      onTriggered: details.refreshRequested()
-    }
   }
 
   // ---------- Period: one row of pills, one range line
@@ -116,9 +106,11 @@ Column {
       width: parent.width
       spacing: Style.space(4)
       Repeater {
-        model: details.pills
+        // Counted, not the array itself: a new array would rebuild every row.
+        model: details.pills.length
         Button {
-          required property var modelData
+          // The row stays put across refreshes; only what it shows changes.
+          readonly property var modelData: details.pills[index] || ({})
           required property int index
           width: (pillRow.width - pillRow.spacing * (details.pills.length - 1)) / details.pills.length
           text: modelData.label
@@ -304,9 +296,12 @@ Column {
     title: "MODELS"
     note: "cost · tokens"
     Repeater {
-      model: details.models
+      // Counted, not the array itself: a new array would rebuild every row.
+      model: details.models.length
       ModelRow {
-        required property var modelData
+        required property int index
+        // The row stays put across refreshes; only what it shows changes.
+        readonly property var modelData: details.models[index] || ({})
         width: details.width
         row: modelData
         name: details.friendlyModelName(modelData.id)
@@ -336,9 +331,12 @@ Column {
     title: "SESSIONS"
     note: "latest " + details.sessions.length
     Repeater {
-      model: details.sessions
+      // Counted, not the array itself: a new array would rebuild every row.
+      model: details.sessions.length
       SessionRow {
-        required property var modelData
+        required property int index
+        // The row stays put across refreshes; only what it shows changes.
+        readonly property var modelData: details.sessions[index] || ({})
         width: details.width
         row: modelData
         expanded: details.expandedSessionId === modelData.id

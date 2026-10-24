@@ -6,7 +6,9 @@ glance at limits with pace, today's tokens and API-equivalent cost, and one
 step further for a details report: any period, models, sessions, cache hit
 rate and cost mix.
 
-Supports **Claude Code**, **Codex** and **Fireworks** (prepaid balance).
+Supports **Claude Code**, **Codex** and **Fireworks** (prepaid balance), and
+pools of accounts behind [CPAMC](#account-pools-cpamc): pooled limits, every
+account's own windows, and one-click kicks for idle ones.
 
 ## Install
 
@@ -45,12 +47,14 @@ everything deeper is one step away.
 - **Header** — the agent's mark and name, the signed-in account email, and
   the plan with its renewal countdown ("PRO · RENEWS IN 30 DAYS"). Auth and
   endpoint problems replace the plan line and repeat in a card. On the right,
-  one small chip per enabled agent and the refresh button. With synced
-  numbers the email line adds "· N devices".
+  one small chip per enabled agent. With synced numbers the email line adds
+  "· N devices".
 - **Limits** — each allowance's percentage used, a meter with a pace tick
   (where usage would sit if spread evenly over the window), and "Resets in …
   · on pace / N% under / ahead of pace". Prepaid agents show their credit
-  balance instead.
+  balance instead. Under the meters, how old the limits are ("Updated 40s
+  ago"), and when the provider refused the last check, why and when the next
+  one happens ("· rate-limited, retrying in 45s").
 - **Today** — tokens and API-equivalent cost for the glance period (setting,
   default Today) over a 7-day column chart; hover a column for its numbers.
 - **Details ›** — opens the report (Enter does too).
@@ -104,30 +108,135 @@ that has never run an AI coding agent draws nothing, and the icon arrives on
 its own the first time a scan finds usage. Drop it with
 `omarchy plugin disable io.github.sherrymaster.omaagents`.
 
+## Account pools (CPAMC)
+
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (CPAMC) can hold
+many accounts per provider and spread an agent's traffic across them. When
+it holds accounts for Codex or Claude, `bin/account-pool` reads each one's
+own limits — in parallel, read-only, with the access token CPAMC already
+stores — and attaches them to the agent's record as `pool`. It never
+refreshes or rewrites a credential: refresh tokens rotate, and a second
+writer would break CPAMC's copy.
+
+CPAMC is found through `$CPAMC_CONFIG`, `~/.config/cliproxyapi/config.yaml`
+or `~/.cli-proxy-api/config.yaml` (its `auth-dir` and port). The agent counts
+as **routed** when its own config sends traffic to that port on localhost —
+Codex's `model_provider` base URL in `~/.codex/config.toml`, Claude's
+`ANTHROPIC_BASE_URL` in the environment or `~/.claude/settings.json`.
+
+**Routed**, the pool replaces the signed-in account everywhere: the bar's
+`session | weekly` figures, the header ("7 accounts via CPAMC", "POOL · 3
+PLUS + 4 FREE") and the limit meters are the serving tier's averages
+("3 Plus pooled"), with "2/3 have room · frees up in 1h 10m · on pace" under
+each. **Not routed**, the accounts still list, flagged "not routed", and the
+meters stay the signed-in account's.
+
+**One account.** With a single account to work with (disabled ones don't
+count), the pool vocabulary goes away: the header shows that account's email
+"via CPAMC" and "PRO · VIA CPAMC", the meters are its own windows with the
+usual reset and pace line, and the section is one row without a tier header
+or checkbox — the kick can only mean it. Likewise, a serving tier left with a
+single account that has capacity shows that account's windows, not an
+average.
+
+**Accounts.** Accounts group into tiers by CPAMC `priority` — the highest
+tier serves while any of it has room, lower tiers are overflow and fold into
+a one-line summary until clicked. Each row shows the account, a mini meter
+per window with its reset, and its state as glyph and word: `● in use`
+(it served tokens within `inUseMinutes`, default 3), `○ idle` (no recent use;
+accent-colored with a checkbox when its window hasn't started, so a kick
+would start it), `■ full · 1h 10m`, `▲ sign in again`, `– disabled`.
+
+Use is literal tokens. Codex logs every turn's tokens together with the
+serving account's rate limits, and each account's reset instants are unique,
+so `account-pool` matches the last 15 minutes of turns in
+`~/.codex/sessions` to their accounts (tooltip: "In use — 18.2K tokens in the
+last 3m"). That read is local and runs on every pass, fast ones included.
+Clients that don't write Codex session logs still register through the
+account's usage percent rising. A kick only starts a window, so it never
+counts as use. The account Codex itself is signed in to carries `SIGN-IN`.
+Hover a row for every window's numbers. With `showAccount` off, emails read
+"Account 1…N".
+
+**Kick.** Idle accounts carry a checkbox; click rows to select them. The
+action button kicks the selection, or every idle account when none is
+selected ("Kick (2)" / "Kick 2 selected"; Shift+K does the same). A
+kick is one tiny request through
+[`codex-kick`](#codex-kick) that starts the account's window so it resets
+sooner; the button spins while it runs, the line under the list reports
+what happened, and the pool is re-read at once. The button is dimmed with
+the reason — in its tooltip and in plain text under the list — when
+`codex-kick` is missing, when its `--probe` fails (with the error), when
+nothing is idle, or for Claude, which it doesn't support.
+
+**Claude accounts** go through the same pool, with three differences.
+CPAMC's Claude files carry no plan, so it is read from the account's OAuth
+profile once a day ("Pro", "Max 5x", "Max 20x"). The account Claude Code
+itself is signed in to is never asked twice: the pool reuses the limits the
+Claude collector just fetched (stale marker included), since Anthropic's
+endpoint allows about one check per account every two minutes. And Claude
+Code transcripts don't record which account served a reply, so token-based
+"in use" works when one Claude account serves a routed Claude Code; with
+several, an account reads as in use when its usage percent rises. Kicking
+is Codex-only.
+
+Account checks reuse a per-account cache in
+`~/.cache/omarchy/agent-usage/pool-<agent>-v1.json`: Codex accounts are
+re-read at most every 30 seconds, Claude accounts every 150 (Anthropic's
+endpoint is strict), with a backoff after refusals. Local-only passes never
+touch the network.
+
+### codex-kick
+
+`codex-kick` is a separate command (not shipped with the plugin) that the
+panel finds on `PATH` or in `~/.local/bin`. The panel needs two modes from
+it: `codex-kick --probe` prints `{"ok": true, …}` when it works, and
+`codex-kick --json <email…>` kicks exactly those accounts and prints one
+JSON object with a per-account `action` (`kicked`, `already_running`,
+`limit`, `error`, `would_kick` with `-n`).
+
 ## Data
 
 Each agent is one JSON record in `~/.local/state/omarchy/agents/usage/`,
 written by the plugin's `bin/usage-update`. That command runs one
 `omarchy-agent-usage-<agent>` collector per agent — wrapped by
-`bin/codex-collector` and `bin/claude-collector` for those two; the widget invokes it
-on separate local, limits, and full refresh timers, and picks up any
-record that lands in the directory regardless of who wrote it.
+`bin/codex-collector` and `bin/claude-collector` for those two — and the
+widget picks up any record that lands in the directory regardless of who
+wrote it.
 
-Codex local usage refreshes every 5 seconds by default. Its local pass reuses
-the last account limits and only rereads session files whose size or mtime
-changed. The per-file token cache lives in SQLite under
-`~/.cache/omarchy/agent-usage/`; the session index uses the same change
-detection. Claude refreshes every 30 seconds; `bin/claude-session-enricher`
-adds full per-day, per-model history and the session index from the same
-transcripts, caching each file's parsed messages by size and mtime in
+Refreshing is automatic; there is no button. Each agent with a record gets
+its own queue (`UpdateLane.qml`): runs within a queue never overlap, so a
+record has one writer at a time, while queues run side by side, so Codex's
+few-second RPC never holds Claude back. Requests that arrive while a run is
+busy merge into one follow-up instead of being dropped. One clock drives
+every queue:
+
+| | Panel open | Panel closed |
+|---|---|---|
+| Opening the panel | every agent refreshes on the spot | — |
+| Claude and Codex local usage | every `fastIntervalSec` (5 s) | with the limits pass |
+| Claude limits | every 30 s | every 2 min |
+| Codex limits | every 15 s | 15 s while Codex is in use, else 60 s |
+| Other agents (Fireworks billing) | `refreshIntervalSec` (5 min), and on open if older than a minute | `refreshIntervalSec` |
+
+Local passes never touch the network: they reuse the last account limits
+and only reread session files whose size or mtime changed. Codex's per-file
+token cache lives in SQLite under `~/.cache/omarchy/agent-usage/`; its
+session index uses the same change detection. `bin/claude-session-enricher`
+adds Claude's full per-day, per-model history and the session index from the
+same transcripts, caching each file's parsed messages by size and mtime in
 `~/.cache/omarchy/agent-usage/claude-session-index-v1.json`. Session titles
 come from Claude Code's own titles, falling back to the first prompt, and
-subagent transcripts count toward their parent session. Codex account limits refresh
-every 15 seconds while local usage is changing and every 60 seconds while
-idle. All providers, including Fireworks billing, refresh every 5 minutes.
-Busy refreshes do not overlap. The manual refresh button updates the selected
-subscription; Codex local changes appear first, followed by fresh account
-limits. A full forced scan remains available through `bin/usage-update --force`.
+subagent transcripts count toward their parent session.
+
+Anthropic's usage endpoint rate-limits hard — roughly one answer every two
+minutes, with 429s (carrying `Retry-After: 0`) for the rest — so Claude's
+cadence is paced to that budget and `bin/claude-limits.pyfrag` backs off
+after a refusal (1, 2, 4, then 5 minutes), never probing inside the backoff.
+A probe under 15 seconds old is reused. The last good limits stay on screen
+marked with their age. Agents without a record yet are found by a discovery
+pass every `refreshIntervalSec`. A full forced scan remains available through
+`bin/usage-update --force`.
 
 Adding an agent therefore never touches this plugin: ship a collector that
 prints the record contract (see the `claude` and `codex` collectors in
@@ -180,22 +289,21 @@ only adds the meter and the spent-of-funded line under the real figure.
 ## Interactions
 
 - Bar: provider logo followed by session and weekly percentages used (`5% | 10%`).
-  A missing window is omitted; no limits shows `—`. Left-click opens the panel,
-  right-click immediately refreshes usage; middle-click has no action.
+  A missing window is omitted; no limits shows `—`. Left-click opens the panel
+  (which refreshes it), right-click refreshes the selected agent without
+  opening; middle-click has no action.
 - Bar figures and popup limit meters share colors at 25%, 50%, 75%, 90%,
   and 95% used: green, teal, lime, amber, orange, then red.
-- Failed refreshes retain last known limits in memory and mark them stale in
-  the bar tooltip. Automatic refresh continues at the configured interval.
-- Refresh button: refresh the selected subscription immediately; Codex
-  local usage appears first, then its account limits. The button spins while
-  the selected provider check is running.
-- Glance: `h`/`l` or the header chips switch agent, `r` refreshes, Enter opens
-  Details, Esc closes.
+- Failed refreshes retain last known limits and mark them stale, with their
+  age, in the bar tooltip and under the meters. Automatic refresh continues.
+- Glance: `h`/`l` or the header chips switch agent, `r` refreshes, Shift+K
+  kicks the selected (or every idle) pooled account, Enter opens Details, Esc
+  closes.
 - Details: `←`/`→` step the period, `1`–`5` pick Today/7D/30D/Cycle/All,
   `j`/`k` scroll, Esc or Backspace go back. Closing the popup returns to the
   glance.
 - Tab moves to the neighbouring bar panel, as everywhere in the shell.
-- IPC: `omarchy-shell omaagents <open|close|toggle|refresh|next|details>`.
+- IPC: `omarchy-shell omaagents <open|close|toggle|refresh|next|details|kick>`.
 
 ## Settings
 
@@ -207,8 +315,9 @@ top-level keys can be set with
 |---|---|---|
 | `glancePeriod` | `"Today"` | Period on the glance: `Today`, `7D`, `30D` or `Cycle` |
 | `showAccount` | `true` | Show the account email (turn off for screen sharing) |
-| `refreshIntervalSec` | `300` | Full refresh of all providers, including billing |
-| `fastIntervalSec` | `5` | Codex local usage refresh interval |
+| `inUseMinutes` | `3` | A pooled account reads "in use" while it served tokens within this many minutes |
+| `refreshIntervalSec` | `300` | Refresh of agents without a faster cadence (Fireworks billing), and discovery of new ones |
+| `fastIntervalSec` | `5` | Claude and Codex local usage refresh while the panel is open |
 | `syncMode` | `"Off"` | `"On"` writes this machine's snapshot and merges the others |
 | `syncDir` | `""` | A folder synced by Syncthing, Dropbox, rsync, … |
 | `syncFileName` | `<hostname>.json` | This machine's snapshot file |
@@ -251,10 +360,10 @@ billing API, so their totals and day counts cover that window. Claude's cover
 every transcript still on disk.
 
 Subscription countdowns use the selected Codex account's live ChatGPT
-entitlement, fetched during account and manual refreshes. The next renewal
+entitlement, fetched during account refreshes. The next renewal
 (or access end for a cancelled subscription) is cached per account; local
 usage passes reuse that date without making network requests. The panel
-recalculates every second while open and immediately on manual refresh,
+recalculates every second while open,
 showing full days, then hours below one day, then minutes below one hour.
 Offline refreshes retain a valid cached date. Past login-token dates never
 produce an expiry message or an invented future billing period.
