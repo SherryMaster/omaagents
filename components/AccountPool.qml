@@ -36,7 +36,7 @@ Column {
     return n
   }
   readonly property int idleCount: summary ? summary.kickable.length : 0
-  readonly property string blockedReason: !canKick ? "Kicking works for Codex accounts only (it uses codex-kick)."
+  readonly property string blockedReason: !canKick ? "Kicking isn't available for " + agentName + " accounts."
     : kicker && kicker.unavailableReason !== "" ? kicker.unavailableReason
     : idleCount === 0 ? "Nothing to kick: every account's window has already started."
     : ""

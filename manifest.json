@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.sherrymaster.omaagents",
   "name": "OmaAgents",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "author": "SherryMaster",
   "license": "MIT",
-  "description": "AI coding agent usage for the Omarchy bar: Claude Code, Codex and Fireworks limits with pace, today's tokens and API-equivalent cost at a glance, and a details report with models, sessions, cache and cost mix for any period, plus CPAMC account pools: pooled limits, per-account windows and kicks.",
+  "description": "AI coding agent usage for the Omarchy bar: Claude Code, Codex and Fireworks limits with pace, today's tokens and API-equivalent cost at a glance, and a details report with models, sessions, cache and cost mix for any period, plus CPAMC account pools: pooled limits, per-account windows and kicks for Codex and Claude.",
   "kinds": [
     "bar-widget"
   ],

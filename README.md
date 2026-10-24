@@ -161,13 +161,12 @@ Hover a row for every window's numbers. With `showAccount` off, emails read
 **Kick.** Idle accounts carry a checkbox; click rows to select them. The
 action button kicks the selection, or every idle account when none is
 selected ("Kick (2)" / "Kick 2 selected"; Shift+K does the same). A
-kick is one tiny request through
-[`codex-kick`](#codex-kick) that starts the account's window so it resets
-sooner; the button spins while it runs, the line under the list reports
+kick is one tiny request through [`codex-kick` or `claude-kick`](#codex-kick)
+that starts the account's window so it resets sooner; the button spins while it runs, the line under the list reports
 what happened, and the pool is re-read at once. The button is dimmed with
 the reason — in its tooltip and in plain text under the list — when
-`codex-kick` is missing, when its `--probe` fails (with the error), when
-nothing is idle, or for Claude, which it doesn't support.
+the tool is missing, when its `--probe` fails (with the error), when CPAMC
+holds no accounts of that kind, or when nothing is idle.
 
 **Claude accounts** go through the same pool, with three differences.
 CPAMC's Claude files carry no plan, so it is read from the account's OAuth
@@ -177,8 +176,7 @@ Claude collector just fetched (stale marker included), since Anthropic's
 endpoint allows about one check per account every two minutes. And Claude
 Code transcripts don't record which account served a reply, so token-based
 "in use" works when one Claude account serves a routed Claude Code; with
-several, an account reads as in use when its usage percent rises. Kicking
-is Codex-only.
+several, an account reads as in use when its usage percent rises.
 
 Account checks reuse a per-account cache in
 `~/.cache/omarchy/agent-usage/pool-<agent>-v1.json`: Codex accounts are
@@ -188,9 +186,12 @@ touch the network.
 
 ### codex-kick
 
-`codex-kick` is a separate command (not shipped with the plugin) that the
-panel finds on `PATH` or in `~/.local/bin`. The panel needs two modes from
-it: `codex-kick --probe` prints `{"ok": true, …}` when it works, and
+`codex-kick` and `claude-kick` are separate commands (not shipped with the
+plugin; one script, with `claude-kick` a symlink that picks Claude by its
+name) that the panel finds on `PATH` or in `~/.local/bin`. A Claude kick is
+a one-word Messages API request on the cheapest model with the account's
+CPAMC token; its rate-limit headers report the fresh 5h and weekly windows.
+The panel needs two modes from each: `codex-kick --probe` prints `{"ok": true, …}` when it works, and
 `codex-kick --json <email…>` kicks exactly those accounts and prints one
 JSON object with a per-account `action` (`kicked`, `already_running`,
 `limit`, `error`, `would_kick` with `-n`).

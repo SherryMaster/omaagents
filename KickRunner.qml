@@ -2,15 +2,19 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Drives codex-kick, the companion tool that starts an idle Codex account's
-// usage window with a one-word request. The panel only offers kicks this
-// runner has vouched for: it finds the tool, asks it to `--probe` itself,
-// and says plainly why kicking is off when the tool is missing or broken.
+// Drives one agent's kick tool (codex-kick, claude-kick), the companion that
+// starts an idle account's usage window with a one-word request. The panel
+// only offers kicks this runner has vouched for: it finds the tool, asks it
+// to `--probe` itself, and says plainly why kicking is off when the tool is
+// missing or broken.
 Item {
   id: runner
   visible: false
 
-  // "probing" | "ready" | "missing" | "broken"
+  property string provider: "codex"
+  readonly property string tool: provider + "-kick"
+
+  // "probing" | "ready" | "missing" | "empty" (no accounts to kick) | "broken"
   property string toolState: "probing"
   property string toolPath: ""
   property string problem: ""
@@ -24,9 +28,10 @@ Item {
   signal kicked()
 
   // Why the kick control is off, in a sentence, or "" when it isn't.
-  readonly property string unavailableReason: toolState === "probing" ? "Checking codex-kick…"
-    : toolState === "missing" ? "codex-kick isn't installed. Put it on your PATH or in ~/.local/bin to kick accounts from here."
-    : toolState === "broken" ? "codex-kick is installed but failing: " + (problem || "unknown error")
+  readonly property string unavailableReason: toolState === "probing" ? "Checking " + tool + "…"
+    : toolState === "missing" ? tool + " isn't installed. Put it on your PATH or in ~/.local/bin to kick accounts from here."
+    : toolState === "empty" ? "CPAMC holds no " + (provider === "claude" ? "Claude" : "Codex") + " accounts to kick."
+    : toolState === "broken" ? tool + " is installed but failing: " + (problem || "unknown error")
     : ""
 
   function probe() {
@@ -49,8 +54,8 @@ Item {
     id: probeProcess
     running: false
     command: ["sh", "-c",
-      "p=$(command -v codex-kick 2>/dev/null); [ -n \"$p\" ] || p=\"$HOME/.local/bin/codex-kick\";"
-      + " [ -x \"$p\" ] || exit 3; echo \"$p\"; exec \"$p\" --probe"]
+      "p=$(command -v \"$0\" 2>/dev/null); [ -n \"$p\" ] || p=\"$HOME/.local/bin/$0\";"
+      + " [ -x \"$p\" ] || exit 3; echo \"$p\"; exec \"$p\" --probe", runner.tool]
     stdout: StdioCollector { id: probeOut; waitForEnd: true }
     stderr: StdioCollector { id: probeErr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -64,6 +69,9 @@ Item {
       try { status = JSON.parse(lines[lines.length - 1]) } catch (e) {}
       if (exitCode === 0 && status && status.ok === true) {
         runner.toolState = "ready"
+        runner.problem = ""
+      } else if (status && status.accounts === 0) {
+        runner.toolState = "empty"
         runner.problem = ""
       } else {
         runner.toolState = "broken"
@@ -91,7 +99,7 @@ Item {
   Process {
     id: markStale
     running: false
-    command: ["sh", "-c", "mkdir -p \"$0\" && touch \"$0/pool-codex.stale\"", runner.cacheDir]
+    command: ["sh", "-c", "mkdir -p \"$0\" && touch \"$0/pool-$1.stale\"", runner.cacheDir, runner.provider]
     onExited: runner.kicked()
   }
 
@@ -102,7 +110,7 @@ Item {
   function describe(report, exitCode, stderr) {
     var at = Date.now()
     if (!report || !Array.isArray(report.results))
-      return { atMs: at, ok: false, text: "codex-kick failed: " + (stderr.split("\n").pop() || "exit code " + exitCode) }
+      return { atMs: at, ok: false, text: tool + " failed: " + (stderr.split("\n").pop() || "exit code " + exitCode) }
     var kicked = [], skipped = [], failed = []
     for (var i = 0; i < report.results.length; i++) {
       var r = report.results[i]

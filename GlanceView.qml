@@ -220,7 +220,7 @@ Column {
     width: parent.width
     summary: glance.poolSummary
     nowMs: glance.nowMs
-    canKick: !!glance.provider && glance.provider.providerId === "codex"
+    canKick: !!glance.kicker
     kicker: glance.kicker
     selection: glance.kickSelection
     expandedTiers: glance.expandedTiers

@@ -101,10 +101,16 @@ Panel {
     kickSelection = ({})
   }
 
+  // The kick tool for an agent, or null when it has none.
+  function kickerFor(id) {
+    return id === "codex" ? codexKicker : id === "claude" ? claudeKicker : null
+  }
+
   // Kicks the selected idle accounts, or every idle one when none is picked.
   // Only accounts the panel shows as idle are ever sent.
   function kickAccounts() {
-    if (!provider || provider.providerId !== "codex" || !provider.pool || !kicker.ready || kicker.running) return
+    var kicker = provider ? kickerFor(provider.providerId) : null
+    if (!kicker || !provider.pool || !kicker.ready || kicker.running) return
     var idle = A.poolSummary(provider.pool, Date.now(), inUseMs).kickable
     var chosen = idle.filter(function(a) { return root.kickSelection[a.id] === true })
     if (chosen.length === 0) chosen = idle
@@ -172,7 +178,8 @@ Panel {
   onOpenedChanged: {
     if (opened) {
       nowMs = Date.now()
-      kicker.probe()
+      codexKicker.probe()
+      claudeKicker.probe()
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     } else {
       page = "glance"
@@ -186,10 +193,16 @@ Panel {
     panelOpen: root.opened
   }
 
-  // Lives outside the popup so a kick finishes even if the panel closes.
+  // These live outside the popup so a kick finishes even if the panel closes.
   KickRunner {
-    id: kicker
+    id: codexKicker
+    provider: "codex"
     onKicked: usage.refreshProvider("codex")
+  }
+  KickRunner {
+    id: claudeKicker
+    provider: "claude"
+    onKicked: usage.refreshProvider("claude")
   }
 
   Timer {
@@ -209,7 +222,12 @@ Panel {
     function refresh(): string { root.refreshNow(); return "ok" }
     function next(): string { root.selectProvider(root.providerIndex + 1); return "ok" }
     function details(): void { root.open(); root.showDetails() }
-    function kick(): string { root.kickAccounts(); return kicker.ready ? "ok" : kicker.unavailableReason }
+    function kick(): string {
+      var kicker = root.provider ? root.kickerFor(root.provider.providerId) : null
+      if (!kicker) return "no kick tool for this agent"
+      root.kickAccounts()
+      return kicker.ready ? "ok" : kicker.unavailableReason
+    }
   }
 
   WidgetButton {
@@ -369,7 +387,7 @@ Panel {
             foreground: root.foreground
             fontFamily: root.fontFamily
             friendlyModelName: usage.friendlyModelName
-            kicker: kicker
+            kicker: root.provider ? root.kickerFor(root.provider.providerId) : null
             kickSelection: root.kickSelection
             expandedTiers: root.expandedTiers
             onProviderPicked: function(index) { root.selectProvider(index) }
