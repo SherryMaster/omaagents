@@ -103,6 +103,8 @@ def load_accounts(auth_dir, provider):
       "disabled": data.get("disabled") is True,
       "_token": str(data.get("access_token") or ""),
       "_accountId": str(data.get("account_id") or ""),
+      # cpamc-login --watch parks a revoked account (disabled + this note).
+      "_broken": str(data.get("cpamc_login_broken") or ""),
     })
   return accounts
 
@@ -427,7 +429,7 @@ def probe(provider, account, previous, shared=None):
     fresh = FETCHERS[provider](account)
   except urllib.error.HTTPError as error:
     if error.code in (401, 403):
-      return {**result, "status": "expired", "note": "CPAMC's login for this account is no longer valid. Sign it in again in CPAMC."}
+      return {**result, "status": "expired", "note": "CPAMC's login for this account is no longer valid. Click it to sign in again."}
     count = int((previous.get("failure") or {}).get("count") or 0) + 1
     delay = BACKOFF_SECONDS[min(count, len(BACKOFF_SECONDS)) - 1]
     note = "rate-limited" if error.code == 429 else f"HTTP {error.code}"
@@ -528,10 +530,14 @@ def build_pool(provider, force, local_only, record=None):
     # that don't write Codex session logs.
     entry["lastActiveMs"] = max(int(state.get("lastActiveMs") or 0), int(used.get("lastMs") or 0))
     entry["recentTokens"] = [[minute, tokens] for minute, tokens in sorted((used.get("minutes") or {}).items())]
-    if account["disabled"]:
+    if account["_broken"]:
+      when, _, why = account["_broken"].rpartition(" ")
+      entry["status"], entry["windows"] = "expired", []
+      entry["note"] = f"{'OpenAI revoked' if why == 'token_revoked' else 'Lost'} CPAMC's login{' on ' + when if when else ''}. Out of rotation — click to sign in again."
+    elif account["disabled"]:
       entry["status"] = "disabled"
     elif not account["_token"]:
-      entry["status"], entry["note"] = "expired", "No access token in CPAMC's file. Sign the account in again."
+      entry["status"], entry["note"] = "expired", "No access token in CPAMC's file. Click to sign in again."
     else:
       entry["status"] = state.get("status") or "unknown"
       if state.get("note"):

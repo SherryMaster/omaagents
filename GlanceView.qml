@@ -25,6 +25,7 @@ Column {
   property string fontFamily: Style.font.family
   property var friendlyModelName: function(id) { return id }
   property var kicker: null
+  property var loginRunner: null
   property var kickSelection: ({})
   property var expandedTiers: ({})
   signal providerPicked(int index)
@@ -222,6 +223,8 @@ Column {
     nowMs: glance.nowMs
     canKick: !!glance.kicker
     kicker: glance.kicker
+    loginRunner: glance.loginRunner
+    agentId: glance.provider ? String(glance.provider.providerId || "") : ""
     selection: glance.kickSelection
     expandedTiers: glance.expandedTiers
     showEmail: glance.showAccount

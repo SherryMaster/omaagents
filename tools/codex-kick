@@ -1,0 +1,662 @@
+#!/usr/bin/env python3
+"""Start the usage-window countdown on CPAMC accounts with a tiny "hi".
+
+Each account's 5-hour window (30-day for ChatGPT Free) only starts ticking on
+first use. Kicking an idle account starts it early, so it resets sooner.
+
+One tool, two providers: run as `codex-kick` for Codex accounts and as
+`claude-kick` (a symlink to this file) for Claude accounts, or pass
+`--provider`. The "hi" goes straight to the provider with the token CPAMC
+already holds. It never touches an agent's own login and never refreshes
+tokens, so it can't break the rotating refresh tokens CPAMC depends on.
+A kick costs a few dozen tokens.
+
+Usage (claude-kick takes the same arguments; its plans are pro and max):
+  codex-kick                kick every idle account
+  codex-kick plus           only Plus accounts (also: free, pro, team)
+  codex-kick 2 5            accounts #2 and #5 (numbers from `codex-kick -l`)
+  codex-kick alice          accounts whose email contains the text
+  codex-kick -l             show usage for all accounts, kick nothing
+  codex-kick -f ...         kick even if the window is already running
+  codex-kick -n ...         dry run: show what would be kicked
+  codex-kick --json ...     machine-readable results (for the OmaAgents panel)
+  codex-kick --probe        check the tool works, print a JSON status line
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+def cpamc_auth_dir() -> Path:
+    """CPAMC's auth-dir: $CPAMC_AUTH_DIR, its config's `auth-dir`, or the default."""
+    if os.environ.get("CPAMC_AUTH_DIR"):
+        return Path(os.environ["CPAMC_AUTH_DIR"]).expanduser()
+    for config in (Path.home() / ".config/cliproxyapi/config.yaml", Path.home() / ".cli-proxy-api/config.yaml"):
+        try:
+            m = re.search(r"^\s*auth-dir:\s*[\"']?([^\"'#\n]+?)[\"']?\s*$", config.read_text(), re.M)
+        except OSError:
+            continue
+        if m:
+            return Path(os.path.expandvars(m.group(1))).expanduser()
+    return Path.home() / ".local" / "share" / "cliproxyapi" / "auth"
+
+
+AUTH_DIR = cpamc_auth_dir()
+# The OmaAgents panel's per-account cache: fresh Claude numbers without
+# spending Anthropic's tight usage-endpoint budget.
+POOL_CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "omarchy" / "agent-usage"
+POOL_CACHE_MAX_AGE_MS = 5 * 60 * 1000
+
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
+USER_AGENT = "codex_cli_rs/0.163.0 (Linux; x86_64)"
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+# Subscription OAuth tokens are only accepted for Claude Code's own requests.
+CLAUDE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
+
+PROVIDERS = {
+    "codex": {"label": "Codex", "model": "gpt-6-luna",
+              "plans": ("free", "plus", "pro", "team", "business", "enterprise"),
+              "order": {"pro": 0, "plus": 1, "team": 2, "business": 3, "enterprise": 4, "free": 5}},
+    "claude": {"label": "Claude", "model": "claude-haiku-5-5",
+               "plans": ("pro", "max", "team", "enterprise"),
+               "order": {"max": 0, "pro": 1, "team": 2, "enterprise": 3}},
+}
+PROVIDER = "claude" if Path(sys.argv[0]).name.startswith("claude") else "codex"
+TOOL = f"{PROVIDER}-kick"
+# A window whose clock has run longer than this is considered already started.
+STARTED_GRACE_SECONDS = 120
+
+# ── colors ────────────────────────────────────────────────────────────────
+
+USE_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def paint(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+def dim(t: str) -> str: return paint("2", t)
+def bold(t: str) -> str: return paint("1", t)
+def green(t: str) -> str: return paint("32", t)
+def yellow(t: str) -> str: return paint("33", t)
+def red(t: str) -> str: return paint("31", t)
+def cyan(t: str) -> str: return paint("36", t)
+
+
+def visible_len(s: str) -> int:
+    out, i = 0, 0
+    while i < len(s):
+        if s[i] == "\033":
+            i = s.index("m", i) + 1
+            continue
+        out += 1
+        i += 1
+    return out
+
+
+def pad(s: str, width: int) -> str:
+    return s + " " * max(0, width - visible_len(s))
+
+
+# ── data ──────────────────────────────────────────────────────────────────
+
+@dataclass
+class Window:
+    used: int
+    length: int  # seconds
+    reset_in: int  # seconds
+
+    @property
+    def started(self) -> bool:
+        return self.used > 0 or (self.length - self.reset_in) > STARTED_GRACE_SECONDS
+
+
+@dataclass
+class Account:
+    num: int
+    email: str
+    plan: str
+    path: Path
+    token: str
+    account_id: str
+    disabled: bool
+    note: str = ""
+    windows: list[Window] = field(default_factory=list)
+    limit_reached: bool = False
+    error: str = ""
+    result: str = ""
+    ok: bool = True
+    kicked: bool = False
+    action: str = ""  # machine-readable outcome for --json
+
+    @property
+    def primary(self) -> Window | None:
+        return self.windows[0] if self.windows else None
+
+
+def pool_cache() -> dict:
+    try:
+        return json.loads((POOL_CACHE / f"pool-{PROVIDER}-v1.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def load_accounts() -> list[Account]:
+    raw = []
+    cache = pool_cache()
+    for p in AUTH_DIR.glob("*.json"):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(d, dict) or d.get("type") != PROVIDER:
+            continue
+        raw.append((p, d))
+    # Claude files carry no plan; the panel's cache knows it from the profile.
+    plan_of = lambda p, d: str(d.get("plan_type") or (cache.get(p.stem) or {}).get("plan") or "").lower()
+    order = PROVIDERS[PROVIDER]["order"]
+    raw.sort(key=lambda pd: (order.get(plan_of(*pd).split(" ")[0], 9), str(pd[1].get("email") or "")))
+    return [
+        Account(
+            num=i,
+            email=str(d.get("email") or p.name),
+            plan=plan_of(p, d) or "?",
+            path=p,
+            token=str(d.get("access_token") or ""),
+            account_id=str(d.get("account_id") or ""),
+            disabled=bool(d.get("disabled")),
+        )
+        for i, (p, d) in enumerate(raw, 1)
+    ]
+
+
+def headers(acc: Account) -> dict:
+    return {
+        "Authorization": f"Bearer {acc.token}",
+        "ChatGPT-Account-Id": acc.account_id,
+        "User-Agent": USER_AGENT,
+        "originator": "codex_cli_rs",
+    }
+
+
+def http_error_text(e: urllib.error.HTTPError) -> str:
+    if e.code == 401:
+        return "login expired - re-login this account in CPAMC"
+    try:
+        body = json.loads(e.read().decode("utf-8", "replace"))
+        err = body.get("error") if isinstance(body.get("error"), dict) else body
+        msg = err.get("message") or err.get("detail") or err.get("code")
+        if msg:
+            return f"HTTP {e.code}: {msg}"
+    except Exception:
+        pass
+    return f"HTTP {e.code}"
+
+
+# ── network ───────────────────────────────────────────────────────────────
+
+def parse_windows(rl: dict) -> list[Window]:
+    out = []
+    for key in ("primary_window", "secondary_window"):
+        w = rl.get(key)
+        if not isinstance(w, dict):
+            continue
+        try:
+            out.append(Window(int(round(float(w["used_percent"]))),
+                              int(w["limit_window_seconds"]),
+                              int(w["reset_after_seconds"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def claude_headers(acc: Account) -> dict:
+    return {
+        "Authorization": f"Bearer {acc.token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "anthropic-version": "2023-06-01",
+        "Accept": "application/json",
+    }
+
+
+def fetch_usage(acc: Account) -> None:
+    if not acc.token:
+        acc.error = "no access token in CPAMC file"
+        return
+    if PROVIDER == "claude":
+        fetch_claude_usage(acc)
+        return
+    req = urllib.request.Request(USAGE_URL, headers=headers(acc))
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            j = json.load(resp)
+    except urllib.error.HTTPError as e:
+        acc.error = http_error_text(e)
+        return
+    except Exception as e:
+        acc.error = f"network error: {e}"
+        return
+    rl = j.get("rate_limit") or {}
+    acc.windows = parse_windows(rl)
+    acc.limit_reached = bool(rl.get("limit_reached")) or rl.get("allowed") is False
+    if j.get("plan_type"):
+        acc.plan = str(j["plan_type"]).lower()
+
+
+def fetch_claude_plan(acc: Account) -> None:
+    """Claude files carry no plan: ask the account's OAuth profile."""
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/profile", headers=claude_headers(acc))
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            org = json.load(resp).get("organization") or {}
+    except Exception:
+        return
+    kind = str(org.get("organization_type") or "").replace("claude_", "")
+    multiple = re.search(r"(\d+x)", str(org.get("rate_limit_tier") or ""))
+    if kind:
+        acc.plan = f"max {multiple.group(1)}" if kind == "max" and multiple else kind
+
+
+def fetch_claude_usage(acc: Account) -> None:
+    """Prefer the panel's fresh copy: Anthropic answers about one usage check
+    per account every two minutes, and the panel already spends that."""
+    if acc.plan == "?":
+        fetch_claude_plan(acc)
+    cached = pool_cache().get(acc.path.stem) or {}
+    age = time.time() * 1000 - int(cached.get("fetchedAtMs") or 0)
+    if cached.get("windows") and age < POOL_CACHE_MAX_AGE_MS:
+        for w in cached["windows"]:
+            try:
+                reset = datetime.fromisoformat(w["resetsAt"]).timestamp() - time.time()
+                acc.windows.append(Window(round(float(w["percent"]) * 100), int(w["lengthSec"]),
+                                          max(0, int(reset)) if w.get("started") else int(w["lengthSec"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        acc.limit_reached = any(w.used >= 100 for w in acc.windows)
+        return
+    req = urllib.request.Request(CLAUDE_USAGE_URL, headers=claude_headers(acc))
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            j = json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            # Not knowing whether the window runs is no reason not to kick:
+            # a kick on a running window only costs a few tokens.
+            acc.note = "usage check rate-limited; window state unknown"
+            return
+        acc.error = http_error_text(e)
+        return
+    except Exception as e:
+        acc.error = f"network error: {e}"
+        return
+    buckets = [(5 * 3600, j.get("five_hour")), (7 * 86400, j.get("seven_day_oauth_apps") or j.get("seven_day"))]
+    raw = [b.get("utilization") for _, b in buckets if isinstance(b, dict)]
+    scale = 1 if any(isinstance(v, (int, float)) and v > 1 for v in raw) else 100
+    for length, b in buckets:
+        if not isinstance(b, dict) or b.get("utilization") is None:
+            continue
+        try:
+            reset = datetime.fromisoformat(str(b["resets_at"]).replace("Z", "+00:00")).timestamp() - time.time()
+        except (KeyError, TypeError, ValueError):
+            reset = length  # no reset yet: the window hasn't started
+        acc.windows.append(Window(round(float(b["utilization"]) * scale), length, max(0, int(reset))))
+    acc.limit_reached = any(w.used >= 100 for w in acc.windows)
+
+
+def claude_windows_from_headers(h) -> list[Window]:
+    out = []
+    for key, length in (("5h", 5 * 3600), ("7d", 7 * 86400)):
+        try:
+            used = float(h[f"anthropic-ratelimit-unified-{key}-utilization"])
+            reset = int(float(h[f"anthropic-ratelimit-unified-{key}-reset"]) - time.time())
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append(Window(round(used * 100 if used <= 1 else used), length, max(0, reset)))
+    return out
+
+
+def send_claude_hi(acc: Account, model: str) -> None:
+    body = {"model": model, "max_tokens": 8,
+            "system": [{"type": "text", "text": CLAUDE_SYSTEM}],
+            "messages": [{"role": "user", "content": "hi"}]}
+    req = urllib.request.Request(CLAUDE_MESSAGES_URL, data=json.dumps(body).encode(), method="POST",
+                                 headers={**claude_headers(acc), "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            fresh = claude_windows_from_headers(resp.headers)
+            json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            acc.limit_reached = True
+            acc.result, acc.action = yellow("limit reached - nothing to kick"), "limit"
+        else:
+            acc.ok = False
+            acc.error = http_error_text(e)
+            acc.result, acc.action = red(acc.error), "error"
+        return
+    except Exception as e:
+        acc.ok = False
+        acc.error = f"failed: {e}"
+        acc.result, acc.action = red(acc.error), "error"
+        return
+    if fresh:
+        acc.windows = fresh
+    acc.kicked = True
+    acc.action = "kicked"
+    acc.result = green("kicked")
+
+
+def windows_from_headers(h) -> list[Window]:
+    out = []
+    for name in ("primary", "secondary"):
+        try:
+            out.append(Window(int(float(h[f"x-codex-{name}-used-percent"])),
+                              int(h[f"x-codex-{name}-window-minutes"]) * 60,
+                              int(h[f"x-codex-{name}-reset-after-seconds"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def send_hi(acc: Account, model: str) -> None:
+    if PROVIDER == "claude":
+        send_claude_hi(acc, model)
+        return
+    body = {
+        "model": model,
+        "instructions": "Reply with one word.",
+        "input": [{"type": "message", "role": "user",
+                   "content": [{"type": "input_text", "text": "hi"}]}],
+        "reasoning": {"effort": "low"},
+        "store": False,
+        "stream": True,
+        "include": [],
+    }
+    req = urllib.request.Request(
+        RESPONSES_URL,
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={**headers(acc),
+                 "Content-Type": "application/json",
+                 "Accept": "text/event-stream",
+                 "OpenAI-Beta": "responses=experimental",
+                 "session_id": str(uuid.uuid4())},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            fresh = windows_from_headers(resp.headers)
+            event = ""
+            for line in resp:
+                line = line.decode("utf-8", "replace").strip()
+                if line.startswith("event:"):
+                    event = line[6:].strip()
+                elif line.startswith("data:") and event in ("response.completed", "response.failed", "error"):
+                    if event != "response.completed":
+                        data = json.loads(line[5:] or "{}")
+                        err = (data.get("response") or {}).get("error") or data.get("error") or {}
+                        raise RuntimeError(err.get("message") or event)
+                    break
+    except urllib.error.HTTPError as e:
+        acc.ok = False
+        if e.code == 429:
+            acc.limit_reached = True
+            acc.result = yellow("limit reached - nothing to kick")
+            acc.ok, acc.action = True, "limit"
+        else:
+            acc.error = http_error_text(e)
+            acc.result, acc.action = red(acc.error), "error"
+        return
+    except Exception as e:
+        acc.ok = False
+        acc.error = f"failed: {e}"
+        acc.result, acc.action = red(acc.error), "error"
+        return
+    if fresh:
+        acc.windows = fresh
+    acc.kicked = True
+    acc.action = "kicked"
+    acc.result = green("kicked")
+
+
+# ── formatting ────────────────────────────────────────────────────────────
+
+def human(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
+def clock(seconds: int) -> str:
+    t = datetime.fromtimestamp(time.time() + seconds)
+    if seconds < 86400:
+        return t.strftime("%H:%M")
+    return t.strftime("%a %H:%M")
+
+
+def window_name(length: int) -> str:
+    if length <= 6 * 3600:
+        return f"{length // 3600}h"
+    if length <= 8 * 86400:
+        return "week"
+    return f"{round(length / 86400)}d"
+
+
+def bar(pct: int, width: int = 10) -> str:
+    pct = max(0, min(100, pct))
+    filled = round(pct / 100 * width)
+    color = green if pct < 60 else yellow if pct < 90 else red
+    return color("█" * filled) + dim("░" * (width - filled))
+
+
+def fmt_window(w: Window | None) -> str:
+    if w is None:
+        return dim("—")
+    label = window_name(w.length)
+    if not w.started:
+        return f"{dim(label.ljust(4))} {bar(0)} {dim('idle')}"
+    return f"{label.ljust(4)} {bar(w.used)} {str(w.used).rjust(3)}%  resets {human(w.reset_in)} {dim('(' + clock(w.reset_in) + ')')}"
+
+
+def print_table(accounts: list[Account], show_result: bool) -> None:
+    rows = []
+    for a in accounts:
+        status = a.result if show_result else ""
+        if a.error:
+            usage = red(a.error)
+        elif a.disabled and not show_result:
+            usage = dim("disabled in CPAMC")
+        else:
+            parts = [fmt_window(w) for w in a.windows] or [dim(a.note or "no usage data")]
+            usage = "   ".join(parts)
+        rows.append((dim(f"{a.num:>2}"), a.email, cyan(a.plan), usage, status))
+    w_email = max([len(r[1]) for r in rows] + [5])
+    w_status = max([visible_len(r[4]) for r in rows] + [0])
+    for num, email, plan, usage, status in rows:
+        line = f" {num}  {pad(email, w_email)}  {pad(plan, 5)}  "
+        if w_status:
+            line += pad(status, w_status) + "  "
+        print(line + usage)
+
+
+def print_json(accounts: list[Account], dry_run: bool) -> None:
+    results = []
+    for a in accounts:
+        results.append({
+            "num": a.num, "email": a.email, "plan": a.plan, "file": a.path.name,
+            "action": a.action or ("disabled" if a.disabled else "listed"),
+            "error": a.error, "note": a.note,
+            "windows": [{"usedPercent": w.used, "lengthSec": w.length, "resetInSec": w.reset_in,
+                         "started": w.started} for w in a.windows],
+        })
+    print(json.dumps({
+        "dryRun": dry_run,
+        "kicked": sum(a.kicked for a in accounts),
+        "failed": sum(not a.ok for a in accounts),
+        "results": results,
+    }))
+
+
+# ── main ──────────────────────────────────────────────────────────────────
+
+def pick(accounts: list[Account], targets: list[str]) -> tuple[list[Account], list[str]]:
+    if not targets:
+        return [a for a in accounts if not a.disabled], []
+    chosen: dict[int, Account] = {}
+    problems = []
+    for t in targets:
+        tl = t.lower()
+        if tl in PROVIDERS[PROVIDER]["plans"]:
+            matches = [a for a in accounts if a.plan.split(" ")[0] == tl and not a.disabled]
+        elif t.isdigit():
+            matches = [a for a in accounts if a.num == int(t)]
+        else:
+            # A full email picks exactly that account, even when it is a
+            # prefix of another (alice2@… vs alice20@…).
+            matches = ([a for a in accounts if a.email.lower() == tl]
+                       or [a for a in accounts if tl in a.email.lower()])
+        if not matches:
+            problems.append(f"no account matches '{t}'")
+        for a in matches:
+            chosen[a.num] = a
+    return sorted(chosen.values(), key=lambda a: a.num), problems
+
+
+def run_parallel(fn, items) -> None:
+    if not items:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(items)) as ex:
+        list(ex.map(fn, items))
+
+
+def status_line(msg: str) -> None:
+    if sys.stderr.isatty():
+        sys.stderr.write(f"\r\033[K{dim(msg)}")
+        sys.stderr.flush()
+
+
+def clear_status() -> None:
+    if sys.stderr.isatty():
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+
+
+def main() -> int:
+    global PROVIDER, TOOL
+    # --provider wins over the name this was run under.
+    for i, arg in enumerate(sys.argv[1:-1], 1):
+        if arg == "--provider" and sys.argv[i + 1] in PROVIDERS:
+            PROVIDER, TOOL = sys.argv[i + 1], f"{sys.argv[i + 1]}-kick"
+    label = PROVIDERS[PROVIDER]["label"]
+    ap = argparse.ArgumentParser(
+        prog=TOOL,
+        description=f"Start the usage-window countdown on idle CPAMC {label} accounts.",
+        epilog="targets: plan names (" + ", ".join(PROVIDERS[PROVIDER]["plans"]) + "), account numbers, or email substrings",
+    )
+    ap.add_argument("--provider", choices=sorted(PROVIDERS), default=PROVIDER, help="which accounts (default: from the command name)")
+    ap.add_argument("targets", nargs="*", help="which accounts (default: all enabled)")
+    ap.add_argument("-l", "--list", action="store_true", help="show usage only, kick nothing")
+    ap.add_argument("-f", "--force", action="store_true", help="kick even if the window is already running")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="show what would be kicked")
+    model = PROVIDERS[PROVIDER]["model"]
+    ap.add_argument("-m", "--model", default=model, help=f"model for the kick (default: {model})")
+    ap.add_argument("--json", action="store_true", help="print machine-readable results instead of the table")
+    ap.add_argument("--probe", action="store_true", help="check the tool works and print a JSON status line")
+    args = ap.parse_args()
+
+    if args.probe:
+        accounts = load_accounts()
+        print(json.dumps({"ok": bool(accounts), "tool": TOOL, "provider": PROVIDER, "version": 3,
+                          "accounts": len(accounts),
+                          "error": "" if accounts else f"no {label} accounts in {AUTH_DIR}"}))
+        return 0 if accounts else 1
+
+    targets = list(args.targets)
+    if targets and targets[0].lower() in ("list", "ls", "status"):
+        args.list = True
+        targets = targets[1:]
+
+    accounts = load_accounts()
+    if not accounts:
+        print(red(f"No {label} accounts found in {AUTH_DIR}"))
+        return 1
+
+    selected, problems = pick(accounts, targets)
+    for p in problems:
+        print(yellow(p))
+    if not selected:
+        return 1
+
+    status_line(f"Checking usage for {len(selected)} account(s)…")
+    run_parallel(fetch_usage, selected)
+    clear_status()
+
+    if args.list:
+        if args.json:
+            print_json(selected, dry_run=False)
+            return 1 if any(a.error for a in selected) else 0
+        print_table(selected, show_result=False)
+        return 1 if any(a.error for a in selected) else 0
+
+    to_kick = []
+    for a in selected:
+        if a.error:
+            a.result, a.ok, a.action = red("can't kick"), False, "error"
+        elif a.limit_reached:
+            a.result, a.action = yellow("limit reached - nothing to kick"), "limit"
+        elif a.primary and a.primary.started and not args.force:
+            a.result, a.action = dim("already running"), "already_running"
+        else:
+            to_kick.append(a)
+
+    if args.dry_run:
+        for a in to_kick:
+            a.result, a.action = cyan("would kick"), "would_kick"
+    elif to_kick:
+        status_line(f"Kicking {len(to_kick)} account(s) with {args.model}…")
+        run_parallel(lambda a: send_hi(a, args.model), to_kick)
+        clear_status()
+
+    if args.json:
+        print_json(selected, dry_run=args.dry_run)
+        return 1 if any(not a.ok for a in selected) else 0
+
+    print_table(selected, show_result=True)
+
+    acted = len(to_kick) if args.dry_run else sum(a.kicked for a in selected)
+    failed = sum(not a.ok for a in selected)
+    summary = f"{acted} would be kicked" if args.dry_run else f"{acted} kicked"
+    summary += f", {len(selected) - acted - failed} skipped"
+    if failed:
+        summary += f", {red(str(failed) + ' failed')}"
+    print(dim("\n" + summary))
+    if not to_kick and not failed and not args.dry_run:
+        print(dim("Nothing idle to kick. Use -f to kick anyway."))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        clear_status()
+        raise SystemExit(130)

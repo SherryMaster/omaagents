@@ -1,0 +1,746 @@
+#!/usr/bin/env python3
+"""Sign a CPAMC account in again without the usual fight.
+
+Two things make CPAMC re-logins painful, and this tool removes both:
+  - CPAMC's Codex sign-in link carries `prompt=login`, which makes OpenAI
+    demand a full sign-in even when the browser is already signed in.
+    The tool drops it.
+  - One browser holds one OpenAI (or Claude) session at a time, so signing
+    in as account B signs the browser out of account A. The tool opens every
+    account in its own browser profile, which stays signed in to that account.
+After the first sign-in in an account's profile, a re-login is one click on
+"Continue".
+
+Why accounts break: CPAMC's tokens belong to the browser sign-in they came
+from (they carry its `session_id`). Signing out of that account in a browser,
+or switching the browser to another account, revokes the session and OpenAI
+then answers CPAMC with `token_revoked`. Keeping each account in its own
+profile, and never signing out there, avoids that.
+
+`--watch` (run by a systemd timer) catches the ones that break anyway: it takes
+a revoked account out of CPAMC's rotation, so requests stop detouring through
+it, and pops up a notification whose "Sign in" button runs this tool.
+
+The sign-in itself is CPAMC's own (`cli-proxy-api -codex-login` and friends),
+so CPAMC writes the fresh tokens. Afterwards the tool puts back the settings
+CPAMC's file had (priority, prefix, ...), and moves aside an old copy if CPAMC
+saved the new login under another name.
+
+Usage:
+  cpamc-login                     list accounts; ▲ marks the ones to sign in again
+  cpamc-login broken              sign in every ▲ account, one after another
+  cpamc-login 3                   account #3 (numbers from the list)
+  cpamc-login alice               accounts whose email contains the text
+  cpamc-login --add codex         add a new account (also: claude, antigravity)
+  cpamc-login --no-open ...       print the sign-in link instead of opening a browser
+  cpamc-login --json ...          one JSON result line (for the OmaAgents panel)
+  cpamc-login --notify ...        desktop notifications (for clicks from the dashboard)
+  cpamc-login --probe             check the tool can work, print a JSON status line
+  cpamc-login --install-handler   let `cpamc-login://` links (the dashboard button) run this tool
+  cpamc-login --watch             find revoked accounts, park them, offer a sign-in (systemd timer)
+  cpamc-login --install-watch     install and start that timer (every 10 minutes)
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG = Path(os.environ.get("CPAMC_CONFIG") or HOME / ".config/cliproxyapi/config.yaml")
+BINARY = Path(os.environ.get("CPAMC_BINARY") or HOME / ".local/bin/cli-proxy-api")
+DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
+PROFILES = DATA / "cpamc-login" / "profiles"
+BACKUPS = DATA / "codex-cpamc-backups"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache")
+POOL_CACHE = CACHE / "omarchy" / "agent-usage"
+LOCKS = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "cpamc-login"
+HANDLER = DATA / "applications" / "cpamc-login-handler.desktop"
+WATCH_STATE = DATA / "cpamc-login" / "watch-state.json"
+UNITS = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "systemd" / "user"
+# Written into a CPAMC file that --watch parked. The OmaAgents panel and the
+# dashboard read it to show "sign in again" instead of plain "disabled".
+MARKER = "cpamc_login_broken"
+# CPAMC's own credential note, which the dashboard shows; its button keys on this.
+NOTE_PREFIX = "Sign in again"
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+USER_AGENT = "codex_cli_rs/0.163.0 (Linux; x86_64)"
+# The panel's own check is this fresh or newer: no need to ask OpenAI again.
+CACHE_TRUST_MS = 15 * 60 * 1000
+SCHEME = "cpamc-login"
+
+# type in CPAMC's file -> how CPAMC signs it in.
+PROVIDERS = {
+    "codex": {"label": "Codex", "flag": "-codex-login", "site": "OpenAI"},
+    "claude": {"label": "Claude", "flag": "-claude-login", "site": "Claude"},
+    "antigravity": {"label": "Antigravity", "flag": "-antigravity-login", "site": "Google"},
+}
+PLAN_ORDER = {"max": 0, "pro": 1, "plus": 2, "team": 3, "business": 4, "enterprise": 5, "free": 6}
+# Keys a login rewrites; everything else in the old file is a setting to keep.
+FRESH_KEYS = {"access_token", "refresh_token", "id_token", "token", "expired", "expires_in", "expiry",
+              "last_refresh", "timestamp", "email", "type", "account_id", "account_uuid", "plan_type",
+              "disabled", "organization_uuid", "organization_name", "claude_device_ids", "project_id",
+              "antigravity_capability_hints"}
+# Always taken from the old file: they are the user's routing choices.
+KEEP_KEYS = ("priority", "prefix")
+TIMEOUT = 600
+
+
+# ---------- output
+
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def paint(code: str, text: str) -> str: return f"\033[{code}m{text}\033[0m" if COLOR else text
+def dim(t: str) -> str: return paint("2", t)
+def bold(t: str) -> str: return paint("1", t)
+def green(t: str) -> str: return paint("32", t)
+def red(t: str) -> str: return paint("31", t)
+def yellow(t: str) -> str: return paint("33", t)
+
+
+class Notifier:
+    """Desktop notifications that update one bubble per sign-in."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled and shutil.which("notify-send") is not None
+        self.ids: dict[str, str] = {}
+
+    def send(self, key: str, title: str, body: str, urgent: bool = False) -> None:
+        if not self.enabled:
+            return
+        cmd = ["notify-send", "-a", "CPAMC", "-p", "-u", "critical" if urgent else "normal"]
+        if key in self.ids:
+            cmd += ["-r", self.ids[key]]
+        try:
+            out = subprocess.run(cmd + [title, body], capture_output=True, text=True, timeout=5).stdout.strip()
+            if out.isdigit():
+                self.ids[key] = out
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+# ---------- CPAMC's accounts
+
+def auth_dir() -> Path:
+    if os.environ.get("CPAMC_AUTH_DIR"):
+        return Path(os.environ["CPAMC_AUTH_DIR"]).expanduser()
+    try:
+        m = re.search(r"^\s*auth-dir:\s*[\"']?([^\"'#\n]+?)[\"']?\s*$", CONFIG.read_text(), re.M)
+    except OSError:
+        m = None
+    return Path(os.path.expandvars(m.group(1))).expanduser() if m else DATA / "cliproxyapi" / "auth"
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def pool_status() -> dict[str, dict]:
+    """What the OmaAgents panel last saw per CPAMC file: {stem: {status, note}}."""
+    seen: dict[str, dict] = {}
+    for provider in PROVIDERS:
+        seen.update(read_json(POOL_CACHE / f"pool-{provider}-v1.json") or {})
+    return seen
+
+
+def load_accounts() -> list[dict]:
+    seen = pool_status()
+    accounts = []
+    for path in sorted(auth_dir().glob("*.json")):
+        data = read_json(path)
+        if not data or data.get("type") not in PROVIDERS:
+            continue
+        state = seen.get(path.stem) or {}
+        parked = bool(data.get(MARKER))
+        broken = parked or not data.get("access_token") or state.get("status") == "expired"
+        accounts.append({
+            "path": path,
+            "provider": data["type"],
+            "email": str(data.get("email") or path.stem),
+            "plan": str(data.get("plan_type") or "").lower(),
+            "priority": int(data.get("priority") or 0) if str(data.get("priority") or "0").lstrip("-").isdigit() else 0,
+            "disabled": data.get("disabled") is True,
+            "broken": broken and (parked or data.get("disabled") is not True),
+            "parked": parked,
+            "note": str(data.get(MARKER) or "") if parked else state.get("note") or "",
+        })
+    order = list(PROVIDERS)
+    accounts.sort(key=lambda a: (order.index(a["provider"]), -a["priority"], PLAN_ORDER.get(a["plan"], 9), a["email"]))
+    for number, account in enumerate(accounts, 1):
+        account["number"] = number
+    return accounts
+
+
+def pick(accounts: list[dict], targets: list[str]) -> tuple[list[dict], list[str]]:
+    chosen, unknown = [], []
+    for target in targets:
+        t = target.lower()
+        if t == "broken":
+            found = [a for a in accounts if a["broken"]]
+        elif t.isdigit():
+            found = [a for a in accounts if a["number"] == int(t)]
+        elif t in PROVIDERS:
+            found = [a for a in accounts if a["provider"] == t]
+        else:
+            exact = [a for a in accounts if a["email"].lower() == t]
+            found = exact or [a for a in accounts if t in a["email"].lower()]
+        if not found and t != "broken":
+            unknown.append(target)
+        for account in found:
+            if account not in chosen:
+                chosen.append(account)
+    return chosen, unknown
+
+
+def print_list(accounts: list[dict]) -> None:
+    if not accounts:
+        print("CPAMC holds no accounts. Add one: cpamc-login --add codex")
+        return
+    provider = None
+    for a in accounts:
+        if a["provider"] != provider:
+            provider = a["provider"]
+            print(bold(PROVIDERS[provider]["label"]))
+        mark = red("▲ sign in again") if a["broken"] else dim("– disabled") if a["disabled"] else green("● ok")
+        plan = a["plan"].upper() if a["plan"] else ""
+        profile = dim(" · profile saved") if profile_dir(a["email"]).is_dir() else ""
+        print(f"  {a['number']:>2}  {a['email']:<34} {plan:<5} {mark}{profile}")
+    broken = sum(a["broken"] for a in accounts)
+    print()
+    print(f"{broken} to sign in again: run " + bold("cpamc-login broken") if broken else dim("Every account is signed in."))
+
+
+# ---------- browser
+
+def browser_command() -> list[str] | None:
+    custom = os.environ.get("CPAMC_LOGIN_BROWSER")
+    if custom:
+        return custom.split()
+    for name in ("chromium", "google-chrome-stable", "brave", "microsoft-edge-stable"):
+        if shutil.which(name):
+            return [name]
+    return None
+
+
+def profile_dir(email: str) -> Path:
+    return PROFILES / re.sub(r"[^A-Za-z0-9@._+-]", "_", email.lower())
+
+
+def open_in_profile(url: str, email: str) -> None:
+    """Opens the link in the account's own browser profile; the profile keeps
+    that account signed in, so the next re-login skips the password."""
+    browser = browser_command()
+    if not browser:
+        raise RuntimeError("no Chromium-family browser found (set CPAMC_LOGIN_BROWSER)")
+    profile = profile_dir(email)
+    profile.mkdir(parents=True, exist_ok=True)
+    os.chmod(profile, 0o700)
+    subprocess.Popen(browser + [f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check",
+                                "--new-window", url],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def easier_url(url: str, provider: str, email: str) -> str:
+    """CPAMC's link, minus the forced password prompt, plus the email to sign in as."""
+    if provider != "codex":
+        return url
+    parts = urllib.parse.urlsplit(url)
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True) if k != "prompt"]
+    if email and "@" in email:
+        query.append(("login_hint", email))
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
+# ---------- one sign-in
+
+def snapshot(directory: Path) -> dict[Path, tuple[float, int]]:
+    out = {}
+    for path in directory.glob("*.json"):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        out[path] = (st.st_mtime, st.st_size)
+    return out
+
+
+def write_in_place(path: Path, data: dict) -> None:
+    # In place, not by rename: CPAMC's watcher follows the file it knows.
+    with open(path, "r+") as handle:
+        handle.seek(0)
+        handle.write(json.dumps(data, indent=2))
+        handle.truncate()
+
+
+def backup(paths: list[Path]) -> Path | None:
+    if not paths:
+        return None
+    folder = BACKUPS / f"relogin-{datetime.now():%Y%m%d-%H%M%S}"
+    folder.mkdir(parents=True, exist_ok=True)
+    os.chmod(folder, 0o700)
+    for path in paths:
+        shutil.copy2(path, folder / path.name)
+    return folder
+
+
+def mark_pool_stale(provider: str) -> None:
+    """Tell the OmaAgents panel to re-read this provider's accounts now."""
+    try:
+        POOL_CACHE.mkdir(parents=True, exist_ok=True)
+        (POOL_CACHE / f"pool-{provider}.stale").touch()
+    except OSError:
+        pass
+
+
+class Busy(Exception):
+    pass
+
+
+def provider_lock(provider: str):
+    """CPAMC's sign-in listens on one fixed port per provider: one at a time."""
+    LOCKS.mkdir(parents=True, exist_ok=True)
+    handle = open(LOCKS / f"{provider}.lock", "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.seek(0)
+        who = handle.read().strip()
+        handle.close()
+        raise Busy(f"another {PROVIDERS[provider]['label']} sign-in is waiting" + (f" ({who})" if who else "")
+                   + " — finish or close it first")
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()} {time.strftime('%H:%M')}")
+    handle.flush()
+    return handle
+
+
+CHILD: subprocess.Popen | None = None
+
+
+def stop_child(*_args) -> None:
+    if CHILD and CHILD.poll() is None:
+        CHILD.terminate()
+        try:
+            CHILD.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            CHILD.kill()
+    sys.exit(130)
+
+
+def sign_in(provider: str, email: str, old: list[Path], args, say, notify: Notifier) -> dict:
+    """Runs CPAMC's sign-in for one account and tidies up its file."""
+    global CHILD
+    result = {"provider": provider, "email": email, "ok": False}
+    key = email or provider
+    who = email or f"a new {PROVIDERS[provider]['label']} account"
+    lock = provider_lock(provider)
+    try:
+        directory = auth_dir()
+        before = snapshot(directory)
+        old_data = {p: read_json(p) or {} for p in old}
+        saved = backup(old)
+
+        CHILD = subprocess.Popen([str(BINARY), "-config", str(CONFIG), PROVIDERS[provider]["flag"], "-no-browser"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, start_new_session=True)
+        url_box: list[str] = []
+        lines: list[str] = []
+        got_url = threading.Event()
+
+        def pump():
+            for line in CHILD.stdout:
+                lines.append(line.rstrip())
+                if not url_box and line.startswith("https://"):
+                    url_box.append(line.strip())
+                    got_url.set()
+            got_url.set()
+
+        threading.Thread(target=pump, daemon=True).start()
+        if not got_url.wait(30) or not url_box:
+            CHILD.kill()
+            tail = next((l for l in reversed(lines) if l.strip()), "no sign-in link")
+            result.update(action="failed", error=f"CPAMC didn't start the sign-in: {tail}")
+            return result
+
+        url = url_box[0] if args.keep_prompt else easier_url(url_box[0], provider, email)
+        first_time = not profile_dir(key).is_dir()
+        if args.no_open:
+            say(f"Open this link in a browser signed in as {who}:\n  {url}")
+        else:
+            open_in_profile(url, key)
+            hint = (f"First time for this account: sign in as {who} once — the window remembers it. "
+                    "Never sign out there: that would revoke CPAMC's login too."
+                    if first_time else "Click Continue in the window that just opened.")
+            say(f"{bold(who)}: {hint}")
+            notify.send(key, f"Sign in {who}", hint)
+        say(dim("Waiting for the sign-in… (Ctrl+C to give up)"))
+
+        try:
+            code = CHILD.wait(timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            CHILD.kill()
+            result.update(action="timeout", error=f"no sign-in within {args.timeout // 60} minutes")
+            return result
+        time.sleep(0.3)  # let the pump drain the last lines
+
+        after = snapshot(directory)
+        changed = [p for p, stamp in after.items() if before.get(p) != stamp]
+        fresh = [(p, read_json(p) or {}) for p in changed]
+        fresh = [(p, d) for p, d in fresh if d.get("type") == provider]
+        if not fresh:
+            tail = next((l for l in reversed(lines) if l.strip() and not l.startswith("[")), f"exit code {code}")
+            result.update(action="failed", error=f"CPAMC saved no login: {tail}")
+            return result
+        path, data = max(fresh, key=lambda pd: after[pd[0]][0])
+        signed_as = str(data.get("email") or "")
+        result.update(file=path.name, signedInAs=signed_as)
+
+        if email and signed_as.lower() != email.lower():
+            result.update(action="wrong_account",
+                          error=f"signed in as {signed_as or 'another account'}, not {email}. "
+                                f"{'That account was added or refreshed instead. ' if signed_as else ''}"
+                                f"In the window, sign out and sign in as {email}, then try again.")
+            return result
+
+        # Put back the user's settings, and retire an old copy saved under another name.
+        merged = dict(data)
+        for old_path, previous in old_data.items():
+            for k, v in previous.items():
+                if k == MARKER or (k == "note" and str(v).startswith(NOTE_PREFIX)):
+                    continue
+                if k in KEEP_KEYS or (k not in FRESH_KEYS and k not in merged):
+                    merged[k] = v
+            # Parked by --watch: back in rotation now (CPAMC's save keeps the old
+            # disabled flag, so say it). Turned off by hand: stays off.
+            if previous.get(MARKER):
+                merged["disabled"] = False
+            elif previous.get("disabled") is True:
+                merged["disabled"] = True
+        merged.pop(MARKER, None)
+        if str(merged.get("note") or "").startswith(NOTE_PREFIX):
+            merged.pop("note")
+        if merged != data:
+            write_in_place(path, merged)
+        retired = []
+        for old_path in old:
+            if old_path != path and old_path.exists():
+                old_path.unlink()  # its copy is in the backup folder
+                retired.append(old_path.name)
+
+        if not email:
+            # A new account's profile was made under the provider's name; give it the email.
+            target = profile_dir(signed_as)
+            if signed_as and not target.exists() and profile_dir(key).exists():
+                profile_dir(key).rename(target)
+
+        mark_pool_stale(provider)
+        forget_broken(signed_as)
+        result.update(ok=True, action="signed_in", kept={k: merged[k] for k in KEEP_KEYS if k in merged},
+                      disabled=merged.get("disabled") is True,
+                      retired=retired, backup=str(saved) if saved else None)
+        return result
+    finally:
+        CHILD = None
+        lock.close()
+
+
+# ---------- the dashboard button
+
+def install_handler() -> str:
+    HANDLER.parent.mkdir(parents=True, exist_ok=True)
+    HANDLER.write_text(
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=CPAMC sign-in\n"
+        "Comment=Sign a CPAMC account in again from the dashboard\n"
+        f"Exec={Path(sys.argv[0]).absolute()} --notify --from-url %u\n"
+        "NoDisplay=true\n"
+        "Terminal=false\n"
+        f"MimeType=x-scheme-handler/{SCHEME};\n")
+    subprocess.run(["xdg-mime", "default", HANDLER.name, f"x-scheme-handler/{SCHEME}"], check=False)
+    if shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", str(HANDLER.parent)], check=False, capture_output=True)
+    return str(HANDLER)
+
+
+def parse_link(link: str) -> tuple[list[str], str]:
+    """cpamc-login://login?email=a@b.c&provider=codex → (targets, provider for --add)."""
+    parts = urllib.parse.urlsplit(link)
+    if parts.scheme != SCHEME:
+        raise ValueError(f"not a {SCHEME}:// link")
+    query = dict(urllib.parse.parse_qsl(parts.query))
+    email, provider = query.get("email", ""), query.get("provider", "")
+    if email:
+        return ([f"{provider}:{email}"] if provider else [email]), ""
+    if provider in PROVIDERS:
+        return [], provider
+    raise ValueError("the link names no account")
+
+
+# ---------- keeping watch
+
+def revoked_reason(path: Path, data: dict, cached: dict) -> str | None:
+    """Why a Codex account's login is dead for sure, or None. Only OpenAI's own
+    word counts: a 403 can be Cloudflare and a timeout is just the network."""
+    if (cached.get("status") in ("ok", "limited") and not cached.get("stale")
+            and time.time() * 1000 - int(cached.get("fetchedAtMs") or 0) < CACHE_TRUST_MS):
+        return None
+    token = str(data.get("access_token") or "")
+    if not token:
+        return "no access token"
+    request = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {token}", "ChatGPT-Account-Id": str(data.get("account_id") or ""),
+        "User-Agent": USER_AGENT, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=20):
+            return None
+    except urllib.error.HTTPError as error:
+        if error.code != 401:
+            return None
+        try:
+            body = json.loads(error.read() or b"{}")
+        except ValueError:
+            body = {}
+        code = str((body.get("error") or {}).get("code") or "") if isinstance(body.get("error"), dict) else ""
+        message = str((body.get("error") or {}).get("message") or "") if isinstance(body.get("error"), dict) else ""
+        if code in ("token_revoked", "refresh_token_invalidated", "token_expired", "invalid_token") or "invalidated" in message:
+            return code or "token revoked"
+        return None
+    except (OSError, ValueError):
+        return None
+
+
+def load_watch_state() -> dict:
+    return read_json(WATCH_STATE) or {}
+
+
+def save_watch_state(state: dict) -> None:
+    WATCH_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = WATCH_STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(WATCH_STATE)
+
+
+def forget_broken(email: str) -> None:
+    state = load_watch_state()
+    if email and state.pop(email.lower(), None) is not None:
+        save_watch_state(state)
+
+
+def offer_sign_in(email: str, provider: str, reason: str) -> None:
+    """A notification whose "Sign in" button runs this tool for the account."""
+    if not shutil.which("notify-send"):
+        return
+    me = str(Path(sys.argv[0]).absolute())
+    body = (f"OpenAI revoked CPAMC's login ({reason}). It's out of rotation until you sign it in again."
+            if provider == "codex" else "CPAMC's login for this account stopped working.")
+    script = ('a=$(notify-send -a CPAMC -u critical -A signin="Sign in" "$1 needs signing in" "$2"); '
+              '[ "$a" = signin ] && exec "$0" --notify "$3:$1"')
+    subprocess.Popen(["sh", "-c", script, me, email, body, provider], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def watch(args) -> int:
+    """Parks Codex accounts OpenAI has revoked and offers each a sign-in, once."""
+    seen = pool_status()
+    state = load_watch_state()
+    found = []
+    for path in sorted(auth_dir().glob("*.json")):
+        data = read_json(path)
+        if not data or data.get("type") not in PROVIDERS:
+            continue
+        email = str(data.get("email") or path.stem)
+        reason = data.get(MARKER) or None
+        if not reason and data.get("disabled") is not True:
+            if data["type"] == "codex":
+                reason = revoked_reason(path, data, seen.get(path.stem) or {})
+            elif (seen.get(path.stem) or {}).get("status") == "expired":
+                reason = "expired"  # Claude: only the panel's word; never parked
+        if not reason:
+            continue
+        found.append(email)
+        if data["type"] == "codex" and not data.get(MARKER):
+            data[MARKER] = f"{datetime.now():%Y-%m-%d %H:%M} {reason}"
+            data["disabled"] = True
+            if not data.get("note"):
+                data["note"] = f"{NOTE_PREFIX}: OpenAI revoked this login ({reason})"
+            write_in_place(path, data)
+            mark_pool_stale("codex")
+            print(f"parked {email}: {reason}")
+        if email.lower() not in state:
+            state[email.lower()] = {"since": int(time.time()), "provider": data["type"]}
+            offer_sign_in(email, data["type"], str(reason).split(" ")[-1])
+    for email in list(state):
+        if email not in {e.lower() for e in found}:
+            state.pop(email)
+    save_watch_state(state)
+    if args.json:
+        print(json.dumps({"ok": True, "broken": found}))
+    elif not found:
+        print("every account is signed in")
+    return 0
+
+
+def install_watch() -> str:
+    UNITS.mkdir(parents=True, exist_ok=True)
+    me = Path(sys.argv[0]).absolute()
+    (UNITS / "cpamc-login-watch.service").write_text(
+        "[Unit]\nDescription=Find revoked CPAMC logins and offer a sign-in\nAfter=cliproxyapi.service\n\n"
+        f"[Service]\nType=oneshot\nExecStart={me} --watch\n")
+    (UNITS / "cpamc-login-watch.timer").write_text(
+        "[Unit]\nDescription=Check CPAMC logins every 10 minutes\n\n"
+        "[Timer]\nOnBootSec=3min\nOnUnitActiveSec=10min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "cpamc-login-watch.timer"], check=False)
+    return str(UNITS / "cpamc-login-watch.timer")
+
+
+# ---------- main
+
+def probe() -> dict:
+    problems = []
+    if not os.access(BINARY, os.X_OK):
+        problems.append(f"CPAMC's binary is missing at {BINARY}")
+    if not CONFIG.is_file():
+        problems.append(f"CPAMC's config is missing at {CONFIG}")
+    if not browser_command():
+        problems.append("no Chromium-family browser found")
+    accounts = load_accounts() if not problems else []
+    return {"ok": not problems, "error": "; ".join(problems) or None, "accounts": len(accounts),
+            "broken": [a["email"] for a in accounts if a["broken"]]}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="cpamc-login", add_help=True,
+                                     description=__doc__.split("\n\n")[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("targets", nargs="*", help="broken, a number, an email or part of one, or a provider")
+    parser.add_argument("--add", choices=sorted(PROVIDERS), help="sign in a new account")
+    parser.add_argument("--json", action="store_true", help="print one JSON result line")
+    parser.add_argument("--notify", action="store_true", help="show desktop notifications")
+    parser.add_argument("--no-open", action="store_true", help="print the link instead of opening a browser")
+    parser.add_argument("--keep-prompt", action="store_true", help="keep CPAMC's forced password prompt")
+    parser.add_argument("--timeout", type=int, default=TIMEOUT, help="seconds to wait per account")
+    parser.add_argument("--from-url", metavar="LINK", help=argparse.SUPPRESS)
+    parser.add_argument("--probe", action="store_true", help="check the tool, print JSON")
+    parser.add_argument("--install-handler", action="store_true", help="register cpamc-login:// links")
+    parser.add_argument("--watch", action="store_true", help="park revoked accounts, offer a sign-in")
+    parser.add_argument("--install-watch", action="store_true", help="install the --watch timer")
+    args = parser.parse_args()
+
+    if args.probe:
+        status = probe()
+        print(json.dumps(status))
+        return 0 if status["ok"] else 1
+    if args.install_handler:
+        print(f"cpamc-login:// links now open this tool ({install_handler()})")
+        return 0
+    if args.install_watch:
+        print(f"watching every 10 minutes ({install_watch()})")
+        return 0
+    if args.watch:
+        return watch(args)
+
+    signal.signal(signal.SIGTERM, stop_child)
+    signal.signal(signal.SIGINT, stop_child)
+    notify = Notifier(args.notify)
+    quiet = args.json
+    say = (lambda *_: None) if quiet else print
+
+    if args.from_url:
+        try:
+            args.targets, add = parse_link(args.from_url)
+        except ValueError as error:
+            notify.send("link", "CPAMC sign-in", str(error), urgent=True)
+            return 2
+        args.add = args.add or add or None
+
+    accounts = load_accounts()
+    jobs: list[tuple[str, str, list[Path]]] = []  # (provider, email, files to replace)
+    if args.add:
+        jobs.append((args.add, "", []))
+    if args.targets:
+        targets, provider_of = [], {}
+        for t in args.targets:
+            # "codex:a@b.c" narrows an email to one provider (a person can have several).
+            prov, _, rest = t.partition(":")
+            if rest and prov in PROVIDERS:
+                targets.append(rest)
+                provider_of[rest.lower()] = prov
+            else:
+                targets.append(t)
+        chosen, unknown = pick(accounts, targets)
+        chosen = [a for a in chosen if provider_of.get(a["email"].lower(), a["provider"]) == a["provider"]]
+        if unknown:
+            message = "no CPAMC account matches " + ", ".join(unknown)
+            if args.json:
+                print(json.dumps({"ok": False, "results": [], "error": message}))
+            else:
+                print(red(message), file=sys.stderr)
+            notify.send("link", "CPAMC sign-in", message, urgent=True)
+            return 2
+        for a in chosen:
+            files = [x["path"] for x in accounts if x["provider"] == a["provider"] and x["email"].lower() == a["email"].lower()]
+            if not any(j[0] == a["provider"] and j[1].lower() == a["email"].lower() for j in jobs):
+                jobs.append((a["provider"], a["email"], files))
+    if not args.add and not args.targets:
+        if args.json:
+            print(json.dumps({"ok": True, "results": [], "accounts": len(accounts),
+                              "broken": [a["email"] for a in accounts if a["broken"]]}))
+        else:
+            print_list(accounts)
+        return 0
+    if not jobs:
+        say(green("Nothing to sign in: every account is fine."))
+        if args.json:
+            print(json.dumps({"ok": True, "results": []}))
+        return 0
+
+    results = []
+    for provider, email, files in jobs:
+        who = email or f"new {PROVIDERS[provider]['label']} account"
+        try:
+            result = sign_in(provider, email, files, args, say, notify)
+        except Busy as error:
+            result = {"provider": provider, "email": email, "ok": False, "action": "busy", "error": str(error)}
+        except Exception as error:  # report it; carry on with the next account
+            result = {"provider": provider, "email": email, "ok": False, "action": "failed",
+                      "error": f"{type(error).__name__}: {error}"}
+        results.append(result)
+        key = email or provider
+        if result["ok"]:
+            name = result.get("signedInAs") or email
+            kept = ", ".join(f"{k} {v}" for k, v in result.get("kept", {}).items())
+            say(green(f"✓ {name} is signed in again") + (dim(f" (kept {kept})") if kept else ""))
+            notify.send(key, f"{name} is signed in", "CPAMC is using it again." + (f" Kept {kept}." if kept else ""))
+        else:
+            say(red(f"✗ {who}: {result['error']}"))
+            notify.send(key, f"Couldn't sign in {who}", result["error"], urgent=True)
+
+    ok = all(r["ok"] for r in results)
+    if args.json:
+        print(json.dumps({"ok": ok, "results": results}))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

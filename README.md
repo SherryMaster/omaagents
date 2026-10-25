@@ -8,7 +8,8 @@ rate and cost mix.
 
 Supports **Claude Code**, **Codex** and **Fireworks** (prepaid balance), and
 pools of accounts behind [CPAMC](#account-pools-cpamc): pooled limits, every
-account's own windows, and one-click kicks for idle ones.
+account's own windows, one-click kicks for idle ones, and one-click sign-in
+for accounts whose login died.
 
 ## Install
 
@@ -25,6 +26,13 @@ Then put it in your bar with `omarchy plugin enable io.github.sherrymaster.omaag
 limits need a signed-in Claude Code CLI; Codex limits need a signed-in Codex
 CLI. Usage never leaves your machine except the providers' own limit
 endpoints that the Omarchy collectors already call.
+
+**CPAMC pools** also want the companion tools in [`tools/`](tools): run
+`tools/install` from the plugin folder once
+(`~/.config/omarchy/plugins/io.github.sherrymaster.omaagents`). It symlinks
+`codex-kick`, `claude-kick` and `cpamc-login` into `~/.local/bin`, so plugin
+updates update them too, registers the `cpamc-login://` link the CPAMC
+dashboard's sign-in button uses, and starts the 10-minute login watcher.
 
 ## How it works
 
@@ -145,7 +153,8 @@ a one-line summary until clicked. Each row shows the account, a mini meter
 per window with its reset, and its state as glyph and word: `● in use`
 (it served tokens within `inUseMinutes`, default 3), `○ idle` (no recent use;
 accent-colored with a checkbox when its window hasn't started, so a kick
-would start it), `■ full · 1h 10m`, `▲ sign in again`, `– disabled`.
+would start it), `■ full · 1h 10m`, `▲ sign in →` (its login died; click to
+sign in again), `– disabled`. A folded tier still says "▲ 2 to sign in".
 
 Use is literal tokens. Codex logs every turn's tokens together with the
 serving account's rate limits, and each account's reset instants are unique,
@@ -168,6 +177,13 @@ the reason — in its tooltip and in plain text under the list — when
 the tool is missing, when its `--probe` fails (with the error), when CPAMC
 holds no accounts of that kind, or when nothing is idle.
 
+**Sign in again.** Click an account marked `▲ sign in →` and
+[`cpamc-login`](#cpamc-login) opens that account's own browser window on
+CPAMC's sign-in page; the row reads `◌ signing in…` until you click Continue
+there, then the pool is re-read and the line under the list says how it went.
+Click the row again to stop. The sign-in outlives a closed panel, and a
+desktop notification says which window to look at.
+
 **Claude accounts** go through the same pool, with three differences.
 CPAMC's Claude files carry no plan, so it is read from the account's OAuth
 profile once a day ("Pro", "Max 5x", "Max 20x"). The account Claude Code
@@ -186,15 +202,53 @@ touch the network.
 
 ### codex-kick
 
-`codex-kick` and `claude-kick` are separate commands (not shipped with the
-plugin; one script, with `claude-kick` a symlink that picks Claude by its
-name) that the panel finds on `PATH` or in `~/.local/bin`. A Claude kick is
+`codex-kick` and `claude-kick` ship in [`tools/`](tools) (one script, with
+`claude-kick` a symlink that picks Claude by its name); the panel finds them
+on `PATH` or in `~/.local/bin`, where `tools/install` links them. A Claude kick is
 a one-word Messages API request on the cheapest model with the account's
 CPAMC token; its rate-limit headers report the fresh 5h and weekly windows.
 The panel needs two modes from each: `codex-kick --probe` prints `{"ok": true, …}` when it works, and
 `codex-kick --json <email…>` kicks exactly those accounts and prints one
 JSON object with a per-account `action` (`kicked`, `already_running`,
 `limit`, `error`, `would_kick` with `-n`).
+
+### cpamc-login
+
+`tools/cpamc-login` signs a CPAMC account in again without the usual fight.
+It runs CPAMC's own sign-in (`cli-proxy-api -codex-login -no-browser`, and the
+Claude and Antigravity equivalents), so CPAMC writes the fresh tokens, but:
+
+- it drops `prompt=login` from CPAMC's Codex link, which otherwise forces a
+  full password sign-in even when the browser is already signed in;
+- it opens the link in the account's own browser profile
+  (`~/.local/share/cpamc-login/profiles/<email>`), which stays signed in to
+  that one account. After the first sign-in there, a re-login is one click
+  on Continue. Never sign out inside that window;
+- afterwards it puts back the file's settings (priority, prefix, …) and
+  backs up the old file to `~/.local/share/codex-cpamc-backups/relogin-*`.
+
+**Why accounts break.** CPAMC's Codex tokens belong to the browser sign-in
+they came from. Signing out of that account in a browser, or switching the
+browser to another account, revokes them, and OpenAI then answers
+`token_revoked`. Separate profiles keep that from happening.
+
+**The watcher.** `cpamc-login --watch` runs every 10 minutes from a systemd
+user timer. When OpenAI says an account's token is revoked (a 401 with its
+own error code, never a 403 or a timeout), it parks the account: `disabled`,
+a `cpamc_login_broken` marker and a "Sign in again" note, so CPAMC stops
+detouring requests through it. Then it shows one notification with a Sign in
+button. The panel shows a parked account as `▲ sign in →`, and a successful
+sign-in puts it back in rotation.
+
+```bash
+cpamc-login                 # every account; ▲ marks the ones to sign in again
+cpamc-login broken          # sign in every ▲ account, one after another
+cpamc-login 3               # or a number, an email, or part of one
+cpamc-login --add codex     # a new account (also claude, antigravity)
+```
+
+The panel uses `cpamc-login --json --notify <agent>:<email>`; the CPAMC
+dashboard's button opens `cpamc-login://login?provider=…&email=…`.
 
 ## Data
 
@@ -299,12 +353,14 @@ only adds the meter and the spent-of-funded line under the real figure.
   age, in the bar tooltip and under the meters. Automatic refresh continues.
 - Glance: `h`/`l` or the header chips switch agent, `r` refreshes, Shift+K
   kicks the selected (or every idle) pooled account, Enter opens Details, Esc
-  closes.
+  closes. Clicking an account marked `▲ sign in →` signs it in again.
 - Details: `←`/`→` step the period, `1`–`5` pick Today/7D/30D/Cycle/All,
   `j`/`k` scroll, Esc or Backspace go back. Closing the popup returns to the
   glance.
 - Tab moves to the neighbouring bar panel, as everywhere in the shell.
-- IPC: `omarchy-shell omaagents <open|close|toggle|refresh|next|details|kick>`.
+- IPC: `omarchy-shell omaagents <open|close|toggle|refresh|next|details|kick>`,
+  and `omarchy-shell omaagents login <codex|claude> <email>` to sign an
+  account in again (again cancels).
 
 ## Settings
 

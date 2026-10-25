@@ -13,6 +13,8 @@ Column {
   property real nowMs: 0
   property bool canKick: false          // this agent's accounts are kickable at all
   property var kicker: null             // KickRunner
+  property var loginRunner: null        // LoginRunner, shared by every agent
+  property string agentId: ""           // codex | claude: what CPAMC calls these accounts
   property var selection: ({})          // account id -> true
   property var expandedTiers: ({})      // priority -> bool
   property bool showEmail: true
@@ -180,6 +182,16 @@ Column {
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(10)
+          // A folded tier must not hide a dead login.
+          Text {
+            readonly property int count: tierBlock.modelData.accounts.filter(function(a) { return a.status === "expired" }).length
+            visible: count > 0
+            text: "▲ " + count + " to sign in"
+            color: Color.urgent
+            font.family: pool.fontFamily
+            font.pixelSize: Style.font.caption
+            anchors.verticalCenter: parent.verticalCenter
+          }
           Repeater {
             // Counted, not the array itself: a new array would rebuild every row.
             model: tierBlock.modelData.windows.length
@@ -245,13 +257,38 @@ Column {
             signedIn: pool.signedInEmail !== "" && modelData.email === pool.signedInEmail
             selected: pool.selection[modelData.id] === true
             kicking: !!pool.kicker && pool.kicker.runningIds[modelData.id] === true
+            canSignIn: !!pool.loginRunner && pool.agentId !== ""
+            signingIn: !!pool.loginRunner && pool.loginRunner.running
+              && pool.loginRunner.provider === pool.agentId && pool.loginRunner.email === modelData.email
             foreground: pool.foreground
             fontFamily: pool.fontFamily
             onToggled: pool.toggled(modelData.id)
+            onSignInRequested: {
+              var answer = pool.loginRunner.toggle(pool.agentId, modelData.email)
+              if (answer !== "ok" && answer !== "cancelled") pool.loginRunner.lastResult = { atMs: Date.now(), ok: false, provider: pool.agentId, text: answer }
+            }
           }
         }
       }
     }
+  }
+
+  // ---------- What the last sign-in did
+  Text {
+    readonly property var runner: pool.loginRunner
+    readonly property var result: runner ? runner.lastResult : null
+    readonly property bool mine: !!runner && (runner.running ? runner.provider === pool.agentId
+      : !!result && result.provider === pool.agentId)
+    readonly property bool fresh: !!result && pool.nowMs - result.atMs < 120000
+    visible: text !== ""
+    width: parent.width
+    text: !mine ? ""
+      : runner.running ? "Signing in " + runner.shortEmail(runner.email) + "… click Continue in the browser window that opened"
+      : fresh ? result.text : ""
+    color: runner && runner.running ? pool.dim : fresh && result.ok ? "#9ece6a" : Color.urgent
+    font.family: pool.fontFamily
+    font.pixelSize: Style.font.caption
+    wrapMode: Text.WordWrap
   }
 
   // ---------- What the last kick did, or why kicking is off

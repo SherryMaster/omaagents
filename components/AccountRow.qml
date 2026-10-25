@@ -5,14 +5,18 @@ import "../Analytics.js" as A
 
 // One pooled account: who, which plan, what state, and a mini meter per
 // window. Idle accounts carry a checkbox (a kick would start their clock);
-// clicking the row toggles it. Status never rides on color alone — every
-// state has its glyph and word.
+// clicking the row toggles it. Clicking an account whose login died signs it
+// in again. Status never rides on color alone — every state has its glyph
+// and word.
 Item {
   id: row
   property var account: null
   property real nowMs: 0
   property bool selected: false
   property bool kicking: false
+  property bool signingIn: false
+  // Off when no sign-in tool is around; the row then only says what's wrong.
+  property bool canSignIn: false
   property bool signedIn: false
   property bool showEmail: true
   // Off when the tier header already names the one plan.
@@ -24,15 +28,18 @@ Item {
   property color foreground: Color.foreground
   property string fontFamily: Style.font.family
   signal toggled()
+  signal signInRequested()
 
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property bool kickable: !!account && account.kickable
+  readonly property bool needsSignIn: !!account && account.status === "expired" && canSignIn
   readonly property var windows: account && account.windows ? account.windows : []
   readonly property string name: showEmail ? String(account ? account.email : "") : "Account " + ordinal
 
   readonly property var statusInfo: {
     var a = account || {}
     if (kicking) return { glyph: "◌", text: "kicking…", color: Color.accent }
+    if (signingIn) return { glyph: "◌", text: "signing in…", color: Color.accent }
     switch (a.status) {
     // Kickable idle is accent-colored (it's actionable); a quiet running
     // window is plain idle.
@@ -40,7 +47,7 @@ Item {
     case "quiet": return { glyph: "○", text: "idle", color: row.dim }
     case "running": return { glyph: "●", text: "in use", color: "#9ece6a" }
     case "limited": return { glyph: "■", text: a.freeInMs > 0 ? "full · " + A.formatDuration(a.freeInMs) : "full", color: "#ff9e64" }
-    case "expired": return { glyph: "▲", text: "sign in again", color: Color.urgent }
+    case "expired": return { glyph: "▲", text: canSignIn ? "sign in →" : "sign in again", color: Color.urgent }
     case "disabled": return { glyph: "–", text: "disabled", color: row.dim }
     default: return { glyph: "…", text: "checking", color: row.dim }
     }
@@ -65,6 +72,8 @@ Item {
     if (a.note) lines.push(a.note)
     if (a.stale) lines.push("Last check failed — numbers may be old")
     if (kickable && selectable) lines.push(selected ? "Click to deselect" : "Click to select for a kick")
+    if (signingIn) lines.push("Waiting for you to click Continue in its browser window — click here to stop")
+    else if (needsSignIn) lines.push("Click to sign in again — opens this account's own browser window")
     return lines.join("\n")
   }
 
@@ -238,8 +247,11 @@ Item {
     id: area
     anchors.fill: parent
     hoverEnabled: true
-    cursorShape: row.kickable && row.selectable ? Qt.PointingHandCursor : Qt.ArrowCursor
-    onClicked: if (row.kickable && row.selectable) row.toggled()
+    cursorShape: row.kickable && row.selectable || row.needsSignIn || row.signingIn ? Qt.PointingHandCursor : Qt.ArrowCursor
+    onClicked: {
+      if (row.needsSignIn || row.signingIn) row.signInRequested()
+      else if (row.kickable && row.selectable) row.toggled()
+    }
   }
 
   PanelToolTip {

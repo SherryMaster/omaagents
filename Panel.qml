@@ -204,6 +204,11 @@ Panel {
     provider: "claude"
     onKicked: usage.refreshProvider("claude")
   }
+  // Also outside the popup: the browser step outlives a closed panel.
+  LoginRunner {
+    id: loginRunner
+    onFinished: function(agent) { usage.refreshProvider(agent) }
+  }
 
   Timer {
     interval: 1000
@@ -222,6 +227,8 @@ Panel {
     function refresh(): string { root.refreshNow(); return "ok" }
     function next(): string { root.selectProvider(root.providerIndex + 1); return "ok" }
     function details(): void { root.open(); root.showDetails() }
+    // Sign a CPAMC account in again: `omarchy-shell omaagents login codex a@b.c`.
+    function login(agent: string, email: string): string { return loginRunner.toggle(agent, email) }
     function kick(): string {
       var kicker = root.provider ? root.kickerFor(root.provider.providerId) : null
       if (!kicker) return "no kick tool for this agent"
@@ -388,6 +395,7 @@ Panel {
             fontFamily: root.fontFamily
             friendlyModelName: usage.friendlyModelName
             kicker: root.provider ? root.kickerFor(root.provider.providerId) : null
+            loginRunner: loginRunner
             kickSelection: root.kickSelection
             expandedTiers: root.expandedTiers
             onProviderPicked: function(index) { root.selectProvider(index) }

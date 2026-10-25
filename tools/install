@@ -1,0 +1,24 @@
+#!/usr/bin/env sh
+# Puts the panel's companion tools on PATH as symlinks into this folder, so a
+# `git pull` of the plugin updates them too:
+#   codex-kick, claude-kick   start idle CPAMC accounts' usage windows
+#   cpamc-login               sign a CPAMC account in again; its watcher timer
+#                             parks revoked accounts and offers a sign-in
+# Usage: tools/install [BIN_DIR]   (default ~/.local/bin)
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+bin=${1:-$HOME/.local/bin}
+mkdir -p "$bin"
+for tool in codex-kick cpamc-login; do
+  if [ -e "$bin/$tool" ] && [ ! -L "$bin/$tool" ]; then
+    mv "$bin/$tool" "$bin/$tool.bak"
+    echo "kept your old $tool as $bin/$tool.bak"
+  fi
+  ln -sfn "$here/$tool" "$bin/$tool"
+done
+# One script, two names: claude-kick picks Claude by the name it's run as.
+ln -sfn codex-kick "$bin/claude-kick"
+echo "linked codex-kick, claude-kick, cpamc-login into $bin"
+# The dashboard's "Sign in again" button and the 10-minute watcher.
+if command -v xdg-mime >/dev/null 2>&1; then "$bin/cpamc-login" --install-handler; fi
+if command -v systemctl >/dev/null 2>&1; then "$bin/cpamc-login" --install-watch; fi
