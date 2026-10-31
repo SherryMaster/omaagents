@@ -4,12 +4,14 @@
 #   codex-kick, claude-kick   start idle CPAMC accounts' usage windows
 #   cpamc-login               sign a CPAMC account in again; its watcher timer
 #                             parks revoked accounts and offers a sign-in
+#   cpamc-claude-models       list every CPAMC model in Claude Code's /model
+#                             picker; its timer keeps the list current
 # Usage: tools/install [BIN_DIR]   (default ~/.local/bin)
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 bin=${1:-$HOME/.local/bin}
 mkdir -p "$bin"
-for tool in codex-kick cpamc-login; do
+for tool in codex-kick cpamc-login cpamc-claude-models; do
   if [ -e "$bin/$tool" ] && [ ! -L "$bin/$tool" ]; then
     mv "$bin/$tool" "$bin/$tool.bak"
     echo "kept your old $tool as $bin/$tool.bak"
@@ -18,7 +20,10 @@ for tool in codex-kick cpamc-login; do
 done
 # One script, two names: claude-kick picks Claude by the name it's run as.
 ln -sfn codex-kick "$bin/claude-kick"
-echo "linked codex-kick, claude-kick, cpamc-login into $bin"
+echo "linked codex-kick, claude-kick, cpamc-login, cpamc-claude-models into $bin"
 # The dashboard's "Sign in again" button and the 10-minute watcher.
 if command -v xdg-mime >/dev/null 2>&1; then "$bin/cpamc-login" --install-handler; fi
-if command -v systemctl >/dev/null 2>&1; then "$bin/cpamc-login" --install-watch; fi
+if command -v systemctl >/dev/null 2>&1; then
+  "$bin/cpamc-login" --install-watch
+  "$bin/cpamc-claude-models" --install-timer
+fi

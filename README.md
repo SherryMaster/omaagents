@@ -30,9 +30,10 @@ endpoints that the Omarchy collectors already call.
 **CPAMC pools** also want the companion tools in [`tools/`](tools): run
 `tools/install` from the plugin folder once
 (`~/.config/omarchy/plugins/io.github.sherrymaster.omaagents`). It symlinks
-`codex-kick`, `claude-kick` and `cpamc-login` into `~/.local/bin`, so plugin
-updates update them too, registers the `cpamc-login://` link the CPAMC
-dashboard's sign-in button uses, and starts the 10-minute login watcher.
+`codex-kick`, `claude-kick`, `cpamc-login` and `cpamc-claude-models` into
+`~/.local/bin`, so plugin updates update them too, registers the
+`cpamc-login://` link the CPAMC dashboard's sign-in button uses, and starts
+the 10-minute login watcher and model-list refresh.
 
 ## How it works
 
@@ -249,6 +250,39 @@ cpamc-login --add codex     # a new account (also claude, antigravity)
 
 The panel uses `cpamc-login --json --notify <agent>:<email>`; the CPAMC
 dashboard's button opens `cpamc-login://login?provider=…&email=…`.
+
+### cpamc-claude-models
+
+`tools/cpamc-claude-models` puts every model CPAMC serves into Claude Code's
+`/model` picker, named the way OpenCode's cpamc plugin names them: a model
+line that comes from several providers gets the provider in brackets
+(`Claude Opus 5.5 [Claude]`, `Claude Opus 5.5 (High) [Antigravity]`). It
+reads CPAMC's model lists and writes three things into
+`~/.claude/settings.json`:
+
+- `modelPicker`: one row per chat model, replacing the built-in lineup.
+  The description gives provider, context window and effort range;
+- `env.CLAUDE_CODE_MODEL_CAPABILITIES`: the effort levels each non-Claude
+  model supports, so `/model` and `/effort` offer only those (GPT up to
+  max, Gemini up to high, GPT-OSS none). Claude models keep Claude Code's
+  own knowledge;
+- `env.CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000` plus
+  `modelSettings.<id>.autoCompactWindow`: Claude Code assumes 200k for a
+  model it doesn't know, so the variable lifts that to 1M and each model's
+  window brings it back to the model's real limit (GPT 6.1 500k, GPT 6 272k,
+  Gemini 1M).
+
+Image-only models are left out, and so are models the upstream answers
+`not_found` for (retired Claude versions), checked once a day with the free
+count_tokens call. The tool only removes what it wrote itself, so a saved
+effort level stays. A systemd timer reruns it every 10 minutes; new Claude
+Code sessions pick the changes up.
+
+```bash
+cpamc-claude-models            # update the settings
+cpamc-claude-models --list     # show the models and what they get
+cpamc-claude-models --remove   # take it all back out
+```
 
 ## Data
 

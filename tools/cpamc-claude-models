@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""Put every CPAMC model in Claude Code's /model picker, the way OpenCode lists them.
+
+Claude Code only knows Claude models. Pointed at CPAMC (ANTHROPIC_BASE_URL), it
+can talk to any model CPAMC serves, since CPAMC translates Claude's request
+format for GPT, Gemini and the rest, but it has no way to list them, size their
+context window or offer only the effort levels each one has. This tool reads
+CPAMC's model list and writes all three into ~/.claude/settings.json:
+
+  modelPicker        one row per model, named as OpenCode's cpamc plugin names
+                     it: the provider is added ("[Claude]", "[Antigravity]")
+                     only when one model line comes from several providers
+  env.CLAUDE_CODE_MODEL_CAPABILITIES
+                     the effort levels each non-Claude model supports (Claude
+                     models keep Claude Code's own knowledge)
+  env.CLAUDE_CODE_MAX_CONTEXT_TOKENS + modelSettings.<id>.autoCompactWindow
+                     each non-Claude model's real context window: Claude Code
+                     assumes 200k for a model it doesn't know, so the variable
+                     lifts that to 1M and each model's autoCompactWindow brings
+                     it back down to the model's own limit
+
+Image-only models are left out (they can't chat), and so are models the
+upstream answers `not_found` for (retired Claude versions CPAMC still lists).
+That check uses the free count_tokens call, at most once a day.
+
+The tool only touches what it wrote before (remembered in its state file), so
+your own modelSettings, such as a saved effort level, stay. Claude Code reads
+these settings when a session starts.
+
+Usage:
+  cpamc-claude-models                 update the settings (prints what changed)
+  cpamc-claude-models --list          show the models and what they'd get, change nothing
+  cpamc-claude-models --quiet         update silently (for the timer)
+  cpamc-claude-models --recheck       re-run the not_found check now
+  cpamc-claude-models --install-timer refresh every 10 minutes (systemd user timer)
+  cpamc-claude-models --remove        take everything it added back out
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+SETTINGS = HOME / ".claude" / "settings.json"
+STATE = HOME / ".local" / "state" / "cpamc-claude-models" / "state.json"
+CLIENT_KEY = HOME / ".config" / "cliproxyapi" / "client-key"
+GATEWAY_CONFIG = HOME / ".config" / "cliproxyapi" / "config.yaml"
+UNITS = HOME / ".config" / "systemd" / "user"
+DEFAULT_BASE = "http://127.0.0.1:8317"
+TIMEOUT = 8
+CODEX_CLIENT_VERSION = "0.160.0"
+ANTHROPIC_VERSION = "2023-06-01"
+DEAD_CHECK_EVERY = 24 * 3600
+
+# Claude Code's limits: autoCompactWindow takes 100k..1M, and 1M is the
+# ceiling it accepts for a context window.
+MIN_WINDOW, MAX_WINDOW = 100_000, 1_000_000
+DEFAULT_CONTEXT, DEFAULT_OUTPUT = 200_000, 32_000
+
+CLAUDE_CODE_LEVELS = ["low", "medium", "high", "xhigh", "max"]
+
+# Everything below, down to resolve_levels(), follows OpenCode's cpamc plugin
+# (~/.config/opencode/plugin/cpamc.js) so both apps name and size models alike.
+PROVIDER_LABELS = {
+    "anthropic": "Claude", "claude": "Claude", "antigravity": "Antigravity",
+    "openai": "OpenAI", "codex": "Codex", "google": "Gemini", "gemini": "Gemini",
+    "vertex": "Vertex", "aistudio": "AI Studio", "kimi": "Kimi", "kimi-ai": "Kimi",
+    "kimi.ai": "Kimi", "kimi.com": "Kimi", "moonshot": "Kimi", "xai": "xAI",
+}
+VALID_LEVELS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+BUDGET_LEVELS = ["low", "medium", "high", "xhigh", "max"]
+NON_CHAT = re.compile(r"(^|[-_/])(image|images|imagine|dall-e|tts|whisper|embed|embedding|rerank|moderation)([-_/]|$)", re.I)
+IMAGE_MODEL = re.compile(r"(^|[-_/])(gpt-image|dall-e|imagen)([-_/]|$)", re.I)
+REASONING = re.compile(r"(thinking|reason|o3|o4|gpt-5|gpt-6|deepseek-r|qwq|r1)", re.I)
+SUFFIX = re.compile(r"-(thinking|high|medium|low|minimal|max|\d{8})$")
+VERSION_SUFFIX = re.compile(r"-(thinking|high|medium|low|minimal|max|preview|latest|\d{8})$")
+
+
+def log(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+# ---------- gateway
+
+def read_settings() -> dict:
+    try:
+        return json.loads(SETTINGS.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def gateway(settings: dict) -> tuple[str, str | None]:
+    """CPAMC's address and client key, as Claude Code itself uses them."""
+    env = settings.get("env", {})
+    base = (env.get("ANTHROPIC_BASE_URL") or DEFAULT_BASE).rstrip("/")
+    for line in env.get("ANTHROPIC_CUSTOM_HEADERS", "").splitlines():
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "x-api-key" and value.strip():
+            return base, value.strip()
+    if os.environ.get("CPAMC_API_KEY", "").strip():
+        return base, os.environ["CPAMC_API_KEY"].strip()
+    if CLIENT_KEY.is_file() and CLIENT_KEY.read_text().strip():
+        return base, CLIENT_KEY.read_text().strip()
+    in_access = False
+    for line in GATEWAY_CONFIG.read_text().splitlines() if GATEWAY_CONFIG.is_file() else []:
+        if re.match(r"^\S", line):
+            in_access = bool(re.match(r"^access:\s*$", line))
+            continue
+        match = re.match(r"^\s+-\s*[\"']?([^\"'\s#]+)", line) if in_access else None
+        if match:
+            return base, match.group(1)
+    return base, None
+
+
+def fetch(url: str, key: str | None, headers: dict | None = None, body: dict | None = None):
+    request = urllib.request.Request(url, data=json.dumps(body).encode() if body else None)
+    if key:
+        request.add_header("Authorization", f"Bearer {key}")
+        request.add_header("x-api-key", key)
+    for name, value in (headers or {}).items():
+        request.add_header(name, value)
+    if body:
+        request.add_header("content-type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            return json.load(error)
+        except Exception:
+            return {"error": {"message": f"HTTP {error.code}"}}
+
+
+def inventory(base: str, key: str | None) -> tuple[list, dict]:
+    """The /v1/models rows, plus each id's metadata from CPAMC's other model lists."""
+    v1 = fetch(f"{base}/v1/models", key)
+    rows = v1.get("data") if isinstance(v1, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError(f"CPAMC at {base} gave no model list: {json.dumps(v1)[:200]}")
+    meta: dict[str, dict] = {}
+    extra = [
+        ("v1beta", f"{base}/v1beta/models", {}, "models", lambda m: str(m.get("name", "")).removeprefix("models/")),
+        ("anth", f"{base}/v1/models", {"anthropic-version": ANTHROPIC_VERSION}, "data", lambda m: m.get("id")),
+        ("codex", f"{base}/v1/models?client_version={CODEX_CLIENT_VERSION}", {}, "models",
+         lambda m: m.get("slug") or m.get("id")),
+    ]
+    for source, url, headers, field, ident in extra:
+        try:
+            payload = fetch(url, key, headers)
+        except Exception:
+            continue
+        for item in payload.get(field) or [] if isinstance(payload, dict) else []:
+            model_id = str(ident(item) or "").strip()
+            if model_id:
+                meta.setdefault(model_id, {})[source] = item
+    return rows, meta
+
+
+# ---------- OpenCode's naming, limits and effort levels
+
+def provider_label(entry: dict, meta: dict) -> str | None:
+    raw = str(entry.get("owned_by") or meta.get("anth", {}).get("owned_by") or "").strip().lower()
+    if not raw:
+        return None
+    return PROVIDER_LABELS.get(raw, raw[:1].upper() + raw[1:])
+
+
+def series_key(model_id: str) -> str:
+    lower = model_id.lower()
+    match = re.match(r"^claude-(?:3-[57]-)?(opus|sonnet|haiku|fable)\b", lower)
+    if match:
+        return f"claude-{match.group(1)}"
+    if lower.startswith("gemini-"):
+        if "image" in lower:
+            return "gemini-image"
+        if "flash-lite" in lower:
+            return "gemini-flash-lite"
+        return "gemini-flash" if "flash" in lower else "gemini-pro"
+    for prefix in ("gpt-image", "gpt-oss"):
+        if lower.startswith(prefix):
+            return prefix
+    if lower.startswith("gpt-"):
+        return "gpt"
+    return SUFFIX.sub("", lower)
+
+
+def version_key(model_id: str) -> str:
+    return VERSION_SUFFIX.sub("", model_id.lower())
+
+
+def base_name(model_id: str, meta: dict) -> str:
+    v1beta, anth, codex = meta.get("v1beta", {}), meta.get("anth", {}), meta.get("codex", {})
+    name = (str(v1beta.get("displayName") or "").strip() or str(anth.get("display_name") or "").strip()
+            or str(codex.get("display_name") or "").strip())
+    description = str(v1beta.get("description") or "").strip()
+    if name and description.startswith(name) and re.search(r"\([^)]+\)$", description):
+        return description
+    if name:
+        return name
+    return " ".join(p[:1].upper() + p[1:] if p[:1].islower() else p for p in re.split(r"[-_/]", model_id) if p)
+
+
+def limits(meta: dict) -> tuple[int, int]:
+    v1beta, anth, codex = meta.get("v1beta", {}), meta.get("anth", {}), meta.get("codex", {})
+
+    def best(*values, default):
+        numbers = []
+        for value in values:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                numbers.append(int(number))
+        return max(numbers) if numbers else default
+
+    context = best(v1beta.get("inputTokenLimit"), anth.get("max_input_tokens"), codex.get("context_window"),
+                   default=DEFAULT_CONTEXT)
+    output = best(v1beta.get("outputTokenLimit"), anth.get("max_tokens"), codex.get("max_output_tokens"),
+                  default=DEFAULT_OUTPUT)
+    return context, output
+
+
+def resolve_levels(model_id: str, meta: dict) -> list[str]:
+    codex = meta.get("codex")
+    if isinstance(codex, dict):
+        raw = []
+        for item in codex.get("supported_reasoning_levels") or []:
+            level = item if isinstance(item, str) else (item or {}).get("effort")
+            if isinstance(level, str) and level.strip():
+                raw.append(level.strip().lower())
+        valid = list(dict.fromkeys(level for level in raw if level in VALID_LEVELS))
+        if codex.get("prefer_websockets"):
+            return valid
+        # CPAMC gives models it has no level list for a stock list ending in
+        # "ultra", and budget-thinking models an empty list with no default.
+        if "ultra" in raw:
+            return []
+        if not raw and codex.get("default_reasoning_level") is None:
+            return list(BUDGET_LEVELS)
+        return valid
+    return ["low", "medium", "high"] if REASONING.search(model_id) else []
+
+
+def chat_capable(model_id: str, meta: dict) -> bool:
+    output = meta.get("v1beta", {}).get("supportedOutputModalities")
+    image_only = (isinstance(output, list) and [str(o).lower() for o in output] == ["image"]) or (
+        IMAGE_MODEL.search(model_id) is not None and not output)
+    return not image_only and not NON_CHAT.search(model_id)
+
+
+def build_models(rows: list, meta: dict) -> list[dict]:
+    series: dict[str, set] = {}
+    versions: dict[str, set] = {}
+    for entry in rows:
+        model_id = str(entry.get("id") or "").strip()
+        label = provider_label(entry, meta.get(model_id, {})) if model_id else None
+        if label:
+            series.setdefault(series_key(model_id), set()).add(label)
+            versions.setdefault(version_key(model_id), set()).add(label)
+
+    models, seen = [], set()
+    for entry in rows:
+        model_id = str(entry.get("id") or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        info = meta.get(model_id, {})
+        name = base_name(model_id, info)
+        label = provider_label(entry, info)
+        shared = len(series.get(series_key(model_id), ())) > 1 or len(versions.get(version_key(model_id), ())) > 1
+        if label and shared and f"[{label.lower()}]" not in name.lower():
+            name = f"{name} [{label}]"
+        context, output = limits(info)
+        models.append({
+            "id": model_id, "name": name, "provider": label or "CPAMC", "context": context, "output": output,
+            "levels": resolve_levels(model_id, info), "chat": chat_capable(model_id, info),
+            "created": int(entry.get("created") or 0),
+        })
+    return models
+
+
+# ---------- Claude Code's view of each model
+
+def is_claude(model_id: str) -> bool:
+    return model_id.lower().startswith("claude-")
+
+
+def short(tokens: int) -> str:
+    if tokens >= 1_000_000:
+        return f"{round(tokens / 1_000_000, 1):g}M"
+    return f"{round(tokens / 1000)}k"
+
+
+def effort_levels(model: dict) -> list[str]:
+    """The levels Claude Code can pick for this model (it has no minimal/none)."""
+    return [level for level in CLAUDE_CODE_LEVELS if level in model["levels"]]
+
+
+def capabilities(model: dict) -> str:
+    levels = effort_levels(model)
+    if not {"low", "medium", "high"} & set(levels):
+        return "-effort"
+    caps = ["effort", "adaptive_thinking"]
+    caps.append("xhigh_effort" if "xhigh" in levels else "-xhigh_effort")
+    caps.append("max_effort" if "max" in levels else "-max_effort")
+    return ",".join(caps)
+
+
+def window(model: dict) -> int:
+    """The context window a Claude Code session on this model gets."""
+    # Opus 4.6 reaches 1M only as its [1m] variant, which a Claude plan
+    # refuses without usage credits, so its row is the standard 200k one.
+    if model["id"].startswith("claude-opus-4-6") or model["id"].startswith("claude-sonnet-4-6"):
+        return min(model["context"], DEFAULT_CONTEXT)
+    return model["context"]
+
+
+def describe(model: dict) -> str:
+    levels = effort_levels(model)
+    effort = f"effort {levels[0]}–{levels[-1]}" if len(levels) > 1 else (
+        f"effort {levels[0]}" if levels else "no effort setting")
+    if is_claude(model["id"]):
+        effort = "Claude Code's own effort levels"
+    return f"{model['provider']} via CPAMC · {short(window(model))} context · {effort}"
+
+
+PROVIDER_ORDER = ["Claude", "Antigravity", "OpenAI", "Codex", "Gemini", "Vertex", "AI Studio", "Kimi", "xAI"]
+
+
+def sort_key(model: dict):
+    rank = PROVIDER_ORDER.index(model["provider"]) if model["provider"] in PROVIDER_ORDER else len(PROVIDER_ORDER)
+    return rank, -model["created"], model["name"].lower()
+
+
+# ---------- dead-model check
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def is_dead(base: str, key: str | None, model_id: str) -> bool:
+    """True only when the upstream says the model doesn't exist (free call)."""
+    try:
+        answer = fetch(f"{base}/v1/messages/count_tokens", key, {"anthropic-version": ANTHROPIC_VERSION},
+                       {"model": model_id, "messages": [{"role": "user", "content": "hi"}]})
+    except Exception:
+        return False
+    message = json.dumps(answer.get("error", "")) if isinstance(answer, dict) else ""
+    return "not_found_error" in message
+
+
+def dead_models(base: str, key: str | None, ids: list[str], state: dict, force: bool) -> set[str]:
+    checked = state.get("dead_checked", {})
+    known = {i for i, v in checked.items() if v.get("dead")}
+    due = [i for i in ids if force or i not in checked or time.time() - checked[i].get("at", 0) > DEAD_CHECK_EVERY]
+    if due:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            for model_id, dead in zip(due, pool.map(lambda i: is_dead(base, key, i), due)):
+                checked[model_id] = {"dead": dead, "at": int(time.time())}
+                (known.add if dead else known.discard)(model_id)
+    state["dead_checked"] = {i: v for i, v in checked.items() if i in ids}
+    return known & set(ids)
+
+
+# ---------- settings
+
+def plan(models: list[dict]) -> dict:
+    rows, caps, windows = [], [], {}
+    for model in sorted(models, key=sort_key):
+        rows.append({"model": model["id"], "label": model["name"], "description": describe(model)})
+        if is_claude(model["id"]):
+            continue
+        caps.append(f"{model['id']}={capabilities(model)}")
+        windows[model["id"]] = max(MIN_WINDOW, min(MAX_WINDOW, model["context"]))
+    return {"rows": rows, "caps": ";".join(caps), "windows": windows}
+
+
+def apply(settings: dict, wanted: dict | None, state: dict) -> dict:
+    """Write `wanted` into settings (None removes everything this tool wrote)."""
+    settings = json.loads(json.dumps(settings))
+    env = settings.setdefault("env", {})
+    model_settings = settings.setdefault("modelSettings", {})
+    for model_id in state.get("windows", []):
+        entry = model_settings.get(model_id)
+        if isinstance(entry, dict):
+            entry.pop("autoCompactWindow", None)
+            if not entry:
+                model_settings.pop(model_id)
+    if wanted is None:
+        settings.pop("modelPicker", None)
+        env.pop("CLAUDE_CODE_MODEL_CAPABILITIES", None)
+        env.pop("CLAUDE_CODE_MAX_CONTEXT_TOKENS", None)
+    else:
+        settings["modelPicker"] = {"replaceBuiltInOptions": True, "options": wanted["rows"]}
+        env["CLAUDE_CODE_MODEL_CAPABILITIES"] = wanted["caps"]
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(MAX_WINDOW)
+        for model_id, window in wanted["windows"].items():
+            model_settings.setdefault(model_id, {})["autoCompactWindow"] = window
+    if not model_settings:
+        settings.pop("modelSettings")
+    return settings
+
+
+def write_settings(settings: dict) -> None:
+    """Atomic replace, keeping the file's mode (it holds the CPAMC key)."""
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    mode = SETTINGS.stat().st_mode & 0o777 if SETTINGS.exists() else 0o600
+    fd, tmp = tempfile.mkstemp(dir=SETTINGS.parent, prefix=".settings.", suffix=".json")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, SETTINGS)
+
+
+def install_timer() -> str:
+    UNITS.mkdir(parents=True, exist_ok=True)
+    me = Path(sys.argv[0]).absolute()
+    (UNITS / "cpamc-claude-models.service").write_text(
+        "[Unit]\nDescription=List CPAMC's models in Claude Code's model picker\nAfter=cliproxyapi.service\n\n"
+        f"[Service]\nType=oneshot\nExecStart={me} --quiet\n")
+    (UNITS / "cpamc-claude-models.timer").write_text(
+        "[Unit]\nDescription=Refresh Claude Code's CPAMC models every 10 minutes\n\n"
+        "[Timer]\nOnBootSec=2min\nOnUnitActiveSec=10min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "cpamc-claude-models.timer"], check=False)
+    return str(UNITS / "cpamc-claude-models.timer")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="cpamc-claude-models", description=__doc__.split("\n\n")[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--list", action="store_true", help="show the models, change nothing")
+    parser.add_argument("--quiet", action="store_true", help="print nothing unless something fails")
+    parser.add_argument("--recheck", action="store_true", help="re-run the not_found check now")
+    parser.add_argument("--install-timer", action="store_true", help="refresh every 10 minutes")
+    parser.add_argument("--remove", action="store_true", help="take out everything this tool added")
+    args = parser.parse_args()
+
+    if args.install_timer:
+        print(f"installed {install_timer()}")
+        return 0
+    settings, state = read_settings(), load_state()
+    if args.remove:
+        write_settings(apply(settings, None, state))
+        save_state({})
+        print(f"removed the CPAMC models from {SETTINGS}")
+        return 0
+
+    base, key = gateway(settings)
+    try:
+        rows, meta = inventory(base, key)
+    except Exception as error:
+        log(f"cpamc-claude-models: {error}; settings left as they were")
+        return 1
+    models = build_models(rows, meta)
+    chat = [m for m in models if m["chat"]]
+    dead = dead_models(base, key, [m["id"] for m in chat], state, args.recheck)
+    usable = [m for m in chat if m["id"] not in dead]
+    wanted = plan(usable)
+
+    if args.list:
+        for row, model in zip(wanted["rows"], sorted(usable, key=sort_key)):
+            caps = "built-in" if is_claude(model["id"]) else capabilities(model)
+            print(f"{row['model']:<32} {row['label']:<44} {short(window(model)):>6}  {caps}")
+        skipped = sorted({m["id"] for m in models if not m["chat"]} | dead)
+        print(f"\n{len(usable)} models; left out: {', '.join(skipped) or 'none'}")
+        save_state({**state, "dead_checked": state.get("dead_checked", {})})
+        return 0
+
+    updated = apply(settings, wanted, state)
+    changed = updated != settings
+    if changed:
+        write_settings(updated)
+    save_state({**state, "windows": sorted(wanted["windows"])})
+    if not args.quiet:
+        verb = "updated" if changed else "already up to date:"
+        print(f"{verb} {len(wanted['rows'])} CPAMC models in {SETTINGS}"
+              + (f" (left out as not found upstream: {', '.join(sorted(dead))})" if dead else ""))
+        if changed:
+            print("new Claude Code sessions pick them up; /model lists them")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
