@@ -7,9 +7,8 @@ format for GPT, Gemini and the rest, but it has no way to list them, size their
 context window or offer only the effort levels each one has. This tool reads
 CPAMC's model list and writes all three into ~/.claude/settings.json:
 
-  modelPicker        one row per model, named as OpenCode's cpamc plugin names
-                     it: the provider is added ("[Claude]", "[Antigravity]")
-                     only when one model line comes from several providers
+  modelPicker        one row per model under its display name; the row's
+                     description names the provider ("Antigravity via CPAMC")
   env.CLAUDE_CODE_MODEL_CAPABILITIES
                      the effort levels each non-Claude model supports (Claude
                      models keep Claude Code's own knowledge)
@@ -71,7 +70,8 @@ DEFAULT_CONTEXT, DEFAULT_OUTPUT = 200_000, 32_000
 CLAUDE_CODE_LEVELS = ["low", "medium", "high", "xhigh", "max"]
 
 # Everything below, down to resolve_levels(), follows OpenCode's cpamc plugin
-# (~/.config/opencode/plugin/cpamc.js) so both apps name and size models alike.
+# (~/.config/opencode/plugin/cpamc.js) so both apps name and size models alike,
+# except that the provider goes in the row's description, not in brackets.
 PROVIDER_LABELS = {
     "anthropic": "Claude", "claude": "Claude", "antigravity": "Antigravity",
     "openai": "OpenAI", "codex": "Codex", "google": "Gemini", "gemini": "Gemini",
@@ -83,8 +83,6 @@ BUDGET_LEVELS = ["low", "medium", "high", "xhigh", "max"]
 NON_CHAT = re.compile(r"(^|[-_/])(image|images|imagine|dall-e|tts|whisper|embed|embedding|rerank|moderation)([-_/]|$)", re.I)
 IMAGE_MODEL = re.compile(r"(^|[-_/])(gpt-image|dall-e|imagen)([-_/]|$)", re.I)
 REASONING = re.compile(r"(thinking|reason|o3|o4|gpt-5|gpt-6|deepseek-r|qwq|r1)", re.I)
-SUFFIX = re.compile(r"-(thinking|high|medium|low|minimal|max|\d{8})$")
-VERSION_SUFFIX = re.compile(r"-(thinking|high|medium|low|minimal|max|preview|latest|\d{8})$")
 
 
 def log(message: str) -> None:
@@ -176,29 +174,6 @@ def provider_label(entry: dict, meta: dict) -> str | None:
     return PROVIDER_LABELS.get(raw, raw[:1].upper() + raw[1:])
 
 
-def series_key(model_id: str) -> str:
-    lower = model_id.lower()
-    match = re.match(r"^claude-(?:3-[57]-)?(opus|sonnet|haiku|fable)\b", lower)
-    if match:
-        return f"claude-{match.group(1)}"
-    if lower.startswith("gemini-"):
-        if "image" in lower:
-            return "gemini-image"
-        if "flash-lite" in lower:
-            return "gemini-flash-lite"
-        return "gemini-flash" if "flash" in lower else "gemini-pro"
-    for prefix in ("gpt-image", "gpt-oss"):
-        if lower.startswith(prefix):
-            return prefix
-    if lower.startswith("gpt-"):
-        return "gpt"
-    return SUFFIX.sub("", lower)
-
-
-def version_key(model_id: str) -> str:
-    return VERSION_SUFFIX.sub("", model_id.lower())
-
-
 def base_name(model_id: str, meta: dict) -> str:
     v1beta, anth, codex = meta.get("v1beta", {}), meta.get("anth", {}), meta.get("codex", {})
     name = (str(v1beta.get("displayName") or "").strip() or str(anth.get("display_name") or "").strip()
@@ -261,15 +236,6 @@ def chat_capable(model_id: str, meta: dict) -> bool:
 
 
 def build_models(rows: list, meta: dict) -> list[dict]:
-    series: dict[str, set] = {}
-    versions: dict[str, set] = {}
-    for entry in rows:
-        model_id = str(entry.get("id") or "").strip()
-        label = provider_label(entry, meta.get(model_id, {})) if model_id else None
-        if label:
-            series.setdefault(series_key(model_id), set()).add(label)
-            versions.setdefault(version_key(model_id), set()).add(label)
-
     models, seen = [], set()
     for entry in rows:
         model_id = str(entry.get("id") or "").strip()
@@ -277,14 +243,10 @@ def build_models(rows: list, meta: dict) -> list[dict]:
             continue
         seen.add(model_id)
         info = meta.get(model_id, {})
-        name = base_name(model_id, info)
         label = provider_label(entry, info)
-        shared = len(series.get(series_key(model_id), ())) > 1 or len(versions.get(version_key(model_id), ())) > 1
-        if label and shared and f"[{label.lower()}]" not in name.lower():
-            name = f"{name} [{label}]"
         context, output = limits(info)
         models.append({
-            "id": model_id, "name": name, "provider": label or "CPAMC", "context": context, "output": output,
+            "id": model_id, "name": base_name(model_id, info), "provider": label or "CPAMC", "context": context, "output": output,
             "levels": resolve_levels(model_id, info), "chat": chat_capable(model_id, info),
             "created": int(entry.get("created") or 0),
         })

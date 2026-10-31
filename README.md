@@ -254,11 +254,10 @@ dashboard's button opens `cpamc-login://login?provider=…&email=…`.
 ### cpamc-claude-models
 
 `tools/cpamc-claude-models` puts every model CPAMC serves into Claude Code's
-`/model` picker, named the way OpenCode's cpamc plugin names them: a model
-line that comes from several providers gets the provider in brackets
-(`Claude Opus 5.5 [Claude]`, `Claude Opus 5.5 (High) [Antigravity]`). It
-reads CPAMC's model lists and writes three things into
-`~/.claude/settings.json`:
+`/model` picker under their display names (`Claude Opus 5.5`,
+`Claude Opus 5.5 (High)`, `GPT 6.1 Sol`), each row's description naming the
+provider (`Antigravity via CPAMC · 1M context · …`). It reads CPAMC's model
+lists and writes three things into `~/.claude/settings.json`:
 
 - `modelPicker`: one row per chat model, replacing the built-in lineup.
   The description gives provider, context window and effort range;
