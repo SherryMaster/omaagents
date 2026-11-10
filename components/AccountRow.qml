@@ -4,8 +4,8 @@ import qs.Ui
 import "../Analytics.js" as A
 
 // One pooled account: who, which plan, what state, and a mini meter per
-// window. Idle accounts carry a checkbox (a kick would start their clock);
-// clicking the row toggles it. Clicking an account whose login died signs it
+// window. Every account carries a checkbox for a kick (on an idle one it
+// starts the clock); clicking the row toggles it. Clicking an account whose login died signs it
 // in again. Status never rides on color alone — every state has its glyph
 // and word.
 Item {

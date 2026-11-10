@@ -8,7 +8,7 @@ rate and cost mix.
 
 Supports **Claude Code**, **Codex** and **Fireworks** (prepaid balance), and
 pools of accounts behind [CPAMC](#account-pools-cpamc): pooled limits, every
-account's own windows, one-click kicks for idle ones, and one-click sign-in
+account's own windows, one-click kicks for any of them, and one-click sign-in
 for accounts whose login died.
 
 ## Install
@@ -153,8 +153,7 @@ tier serves while any of it has room, lower tiers are overflow and fold into
 a one-line summary until clicked. Each row shows the account, a mini meter
 per window with its reset, and its state as glyph and word: `● in use`
 (it served tokens within `inUseMinutes`, default 3), `○ idle` (no recent use;
-accent-colored with a checkbox when its window hasn't started, so a kick
-would start it), `■ full · 1h 10m`, `▲ sign in →` (its login died; click to
+accent-colored when its window hasn't started, so a kick would start it), `■ full · 1h 10m`, `▲ sign in →` (its login died; click to
 sign in again), `– disabled`. A folded tier still says "▲ 2 to sign in".
 
 Use is literal tokens. Codex logs every turn's tokens together with the
@@ -168,15 +167,17 @@ counts as use. The account Codex itself is signed in to carries `SIGN-IN`.
 Hover a row for every window's numbers. With `showAccount` off, emails read
 "Account 1…N".
 
-**Kick.** Idle accounts carry a checkbox; click rows to select them. The
-action button kicks the selection, or every idle account when none is
-selected ("Kick (2)" / "Kick 2 selected"; Shift+K does the same). A
-kick is one tiny request through [`codex-kick` or `claude-kick`](#codex-kick)
-that starts the account's window so it resets sooner; the button spins while it runs, the line under the list reports
+**Kick.** Kick any account at any time, whatever its state — idle, running,
+full or unchecked. Every account carries a checkbox; click rows to select
+them. The action button kicks the selection, or every account that isn't
+disabled or signed out when none is selected ("Kick all (2)" / "Kick 2
+selected"; Shift+K does the same). A kick is one tiny request through
+[`codex-kick` or `claude-kick`](#codex-kick), always sent with `--force`; on
+an idle account it starts the window so it resets sooner; the button spins while it runs, the line under the list reports
 what happened, and the pool is re-read at once. The button is dimmed with
-the reason — in its tooltip and in plain text under the list — when
-the tool is missing, when its `--probe` fails (with the error), when CPAMC
-holds no accounts of that kind, or when nothing is idle.
+the reason — in its tooltip and in plain text under the list — only when
+the tool is missing, when its `--probe` fails (with the error), or when CPAMC
+holds no accounts of that kind.
 
 **Sign in again.** Click an account marked `▲ sign in →` and
 [`cpamc-login`](#cpamc-login) opens that account's own browser window on
@@ -209,7 +210,7 @@ on `PATH` or in `~/.local/bin`, where `tools/install` links them. A Claude kick 
 a one-word Messages API request on the cheapest model with the account's
 CPAMC token; its rate-limit headers report the fresh 5h and weekly windows.
 The panel needs two modes from each: `codex-kick --probe` prints `{"ok": true, …}` when it works, and
-`codex-kick --json <email…>` kicks exactly those accounts and prints one
+`codex-kick --json --force <email…>` kicks exactly those accounts, whatever their state, and prints one
 JSON object with a per-account `action` (`kicked`, `already_running`,
 `limit`, `error`, `would_kick` with `-n`).
 
@@ -385,7 +386,7 @@ only adds the meter and the spent-of-funded line under the real figure.
 - Failed refreshes retain last known limits and mark them stale, with their
   age, in the bar tooltip and under the meters. Automatic refresh continues.
 - Glance: `h`/`l` or the header chips switch agent, `r` refreshes, Shift+K
-  kicks the selected (or every idle) pooled account, Enter opens Details, Esc
+  kicks the selected (or every live) pooled account, Enter opens Details, Esc
   closes. Clicking an account marked `▲ sign in →` signs it in again.
 - Details: `←`/`→` step the period, `1`–`5` pick Today/7D/30D/Cycle/All,
   `j`/`k` scroll, Esc or Backspace go back. Closing the popup returns to the

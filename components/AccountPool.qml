@@ -6,7 +6,7 @@ import "../Analytics.js" as A
 // Every account CPAMC holds for the agent, grouped into routing tiers. The
 // first tier (the one serving requests) is open; overflow tiers fold into a
 // one-line summary until asked for. One action bar kicks either the selected
-// accounts or every idle one, and says why when it can't.
+// accounts or every live one, whatever their state, and says why when it can't.
 Column {
   id: pool
   property var summary: null
@@ -31,16 +31,16 @@ Column {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property var tiers: summary ? summary.tiers : []
   readonly property bool single: !!summary && summary.single
-  // Only idle accounts can be selected; one that started meanwhile drops out.
+  // Any account can be selected, whatever its state.
   readonly property int selectedCount: {
     var n = 0, list = summary ? summary.kickable : []
     for (var i = 0; i < list.length; i++) if (selection[list[i].id]) n++
     return n
   }
-  readonly property int idleCount: summary ? summary.kickable.length : 0
+  readonly property int liveCount: summary
+    ? summary.kickable.filter(function(a) { return a.status !== "disabled" && a.status !== "expired" }).length : 0
   readonly property string blockedReason: !canKick ? "Kicking isn't available for " + agentName + " accounts."
     : kicker && kicker.unavailableReason !== "" ? kicker.unavailableReason
-    : idleCount === 0 ? "Nothing to kick: every account's window has already started."
     : ""
 
   function tierExpanded(tier, index) {
@@ -100,17 +100,17 @@ Column {
         iconSize: Style.font.caption
         text: pool.kicker && pool.kicker.running ? "Kicking…"
           : pool.selectedCount > 0 ? "Kick " + pool.selectedCount + " selected"
-          : "Kick" + (pool.idleCount > 0 && !pool.single ? " (" + pool.idleCount + ")" : "")
+          : "Kick" + (pool.liveCount > 0 && !pool.single ? " all (" + pool.liveCount + ")" : "")
         fontSize: Style.font.caption
         foreground: pool.foreground
         fontFamily: pool.fontFamily
         verticalPadding: Style.space(2)
         opacity: usable || (pool.kicker && pool.kicker.running) ? 1 : 0.42
         tooltipText: pool.blockedReason !== "" ? pool.blockedReason
-          : "Send a one-word request (~25 tokens) to start "
-            + (pool.single ? "this account's" : pool.selectedCount > 0 ? "the selected accounts'"
-              : "the " + pool.idleCount + " not-started accounts'")
-            + " usage window, so it resets sooner. Shortcut: Shift+K"
+          : "Send a one-word request (~25 tokens) to "
+            + (pool.single ? "this account" : pool.selectedCount > 0 ? "the selected accounts"
+              : "all " + pool.liveCount + " accounts")
+            + ", whatever their state; a window that hasn't started starts counting down. Shortcut: Shift+K"
         onClicked: if (usable) pool.kickRequested()
       }
     }

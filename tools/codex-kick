@@ -575,7 +575,7 @@ def main() -> int:
     ap.add_argument("--provider", choices=sorted(PROVIDERS), default=PROVIDER, help="which accounts (default: from the command name)")
     ap.add_argument("targets", nargs="*", help="which accounts (default: all enabled)")
     ap.add_argument("-l", "--list", action="store_true", help="show usage only, kick nothing")
-    ap.add_argument("-f", "--force", action="store_true", help="kick even if the window is already running")
+    ap.add_argument("-f", "--force", action="store_true", help="kick no matter what: running, full, or usage check failed")
     ap.add_argument("-n", "--dry-run", action="store_true", help="show what would be kicked")
     model = PROVIDERS[PROVIDER]["model"]
     ap.add_argument("-m", "--model", default=model, help=f"model for the kick (default: {model})")
@@ -619,11 +619,18 @@ def main() -> int:
 
     to_kick = []
     for a in selected:
-        if a.error:
+        # --force sends the kick whatever the usage check said; only an
+        # account with no token at all can't be tried.
+        if not a.token:
+            a.result, a.ok, a.action = red("can't kick"), False, "error"
+        elif args.force:
+            a.error = ""
+            to_kick.append(a)
+        elif a.error:
             a.result, a.ok, a.action = red("can't kick"), False, "error"
         elif a.limit_reached:
             a.result, a.action = yellow("limit reached - nothing to kick"), "limit"
-        elif a.primary and a.primary.started and not args.force:
+        elif a.primary and a.primary.started:
             a.result, a.action = dim("already running"), "already_running"
         else:
             to_kick.append(a)

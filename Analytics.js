@@ -660,13 +660,14 @@ function liveWindow(w, nowMs) {
 var IN_USE_MS = 3 * 60000
 
 // idle: nothing counting down yet, so a kick starts its clock.
+// Every account is kickable, whatever its state: the kick is the user's call.
 // quiet: counting down, but no use for a while; it reads as idle too.
 // running: served tokens within the last inUseMs. limited: a window is full.
 function accountView(a, nowMs, inUseMs) {
   var windows = ((a && a.windows) || []).map(function(w) { return liveWindow(w, nowMs) })
   var view = { id: String(a.id || a.email || ""), email: String(a.email || ""), plan: String(a.plan || ""),
     planLabel: planLabel(a.plan), priority: num(a.priority), windows: windows, note: String(a.note || ""),
-    stale: a.stale === true, freeInMs: -1, kickable: false,
+    stale: a.stale === true, freeInMs: -1, kickable: true,
     lastActiveMs: num(a.lastActiveMs), quietMs: num(a.lastActiveMs) > 0 ? nowMs - num(a.lastActiveMs) : -1,
     recentTokens: 0 }
   var span = inUseMs > 0 ? inUseMs : IN_USE_MS
@@ -684,7 +685,6 @@ function accountView(a, nowMs, inUseMs) {
     view.freeInMs = full.length ? Math.max.apply(null, full.map(function(w) { return w.resetMs })) : -1
   } else if (!windows[0].started) {
     view.status = "idle"
-    view.kickable = true
   } else {
     var recent = view.lastActiveMs > 0 && nowMs - view.lastActiveMs < span
     view.status = recent ? "running" : "quiet"
@@ -724,7 +724,8 @@ function poolSummary(pool, nowMs, inUseMs) {
     single: active.length === 1, only: active.length === 1 ? active[0] : null,
     open: accounts.filter(function(x) { return x.usable }).length,
     total: accounts.filter(function(x) { return x.status !== "disabled" }).length,
-    kickable: accounts.filter(function(x) { return x.kickable })
+    kickable: accounts.filter(function(x) { return x.kickable }),
+    idle: accounts.filter(function(x) { return x.status === "idle" })
   }
 }
 

@@ -106,14 +106,14 @@ Panel {
     return id === "codex" ? codexKicker : id === "claude" ? claudeKicker : null
   }
 
-  // Kicks the selected idle accounts, or every idle one when none is picked.
-  // Only accounts the panel shows as idle are ever sent.
+  // Kicks the selected accounts, whatever their state, or every live one
+  // (not disabled or signed out) when none is picked.
   function kickAccounts() {
     var kicker = provider ? kickerFor(provider.providerId) : null
     if (!kicker || !provider.pool || !kicker.ready || kicker.running) return
-    var idle = A.poolSummary(provider.pool, Date.now(), inUseMs).kickable
-    var chosen = idle.filter(function(a) { return root.kickSelection[a.id] === true })
-    if (chosen.length === 0) chosen = idle
+    var all = A.poolSummary(provider.pool, Date.now(), inUseMs).kickable
+    var chosen = all.filter(function(a) { return root.kickSelection[a.id] === true })
+    if (chosen.length === 0) chosen = all.filter(function(a) { return a.status !== "disabled" && a.status !== "expired" })
     if (chosen.length === 0) return
     kicker.kick(chosen.map(function(a) { return a.email }), chosen.map(function(a) { return a.id }))
     kickSelection = ({})
@@ -256,7 +256,7 @@ Panel {
           lines.push("Overflow: " + pool.tiers[t].open + "/" + pool.tiers[t].total + " " + pool.tiers[t].label + " open")
         var busy = pool.accounts.filter(function(a) { return a.status === "running" }).length
         if (!pool.single) lines.push(busy + " in use now")
-        if (pool.kickable.length) lines.push(pool.kickable.length + " not started — kick from the panel (Shift+K)")
+        if (pool.idle.length) lines.push(pool.idle.length + " not started — kick from the panel (Shift+K)")
       }
       if (!root.barLimits.length) lines.push("Limits unavailable")
       if (root.refreshing && Date.now() - root.manualRefreshAtMs < 20000) lines.push("Refreshing usage…")

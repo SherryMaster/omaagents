@@ -38,13 +38,14 @@ Item {
     if (!probeProcess.running) probeProcess.running = true
   }
 
-  // emails: the accounts to kick; empty kicks every idle one.
+  // emails: the accounts to kick; empty kicks every enabled one. Always
+  // forced: running, full or unchecked accounts are sent the kick too.
   function kick(emails, ids) {
     if (!ready || kickProcess.running) return
     var marks = {}
     for (var i = 0; i < ids.length; i++) marks[ids[i]] = true
     runningIds = marks
-    kickProcess.command = [toolPath, "--json"].concat(emails)
+    kickProcess.command = [toolPath, "--json", "--force"].concat(emails)
     kickProcess.running = true
   }
 
@@ -116,11 +117,11 @@ Item {
       var r = report.results[i]
       if (r.action === "kicked" || r.action === "would_kick") kicked.push(shortEmail(r.email))
       else if (r.action === "error") failed.push(shortEmail(r.email) + ": " + r.error)
-      else if (r.action === "already_running" || r.action === "limit") skipped.push(shortEmail(r.email))
+      else if (r.action === "limit") skipped.push(shortEmail(r.email))
     }
     var parts = []
     if (kicked.length) parts.push((report.dryRun ? "Would kick " : "Kicked ") + kicked.join(", "))
-    if (skipped.length) parts.push(skipped.length + " already counting down")
+    if (skipped.length) parts.push(skipped.length + " at the limit")
     if (failed.length) parts.push("failed " + failed.join("; "))
     if (!parts.length) parts.push("Nothing to kick")
     return { atMs: at, ok: failed.length === 0, text: parts.join(" · ") }

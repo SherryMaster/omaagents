@@ -235,11 +235,14 @@ test("accountView classifies idle, running, limited, expired", () => {
   const s = A.poolSummary(POOL, NOW)
   const by = Object.fromEntries(s.accounts.map((a) => [a.id, a]))
   assert.equal(by.p1.status, "idle"); assert.equal(by.p1.kickable, true)
-  assert.equal(by.p2.status, "running"); assert.equal(by.p2.kickable, false)
+  assert.equal(by.p2.status, "running"); assert.equal(by.p2.kickable, true)
   assert.equal(by.p3.status, "limited"); close(by.p3.freeInMs, 3600000)
   assert.equal(by.x.status, "expired")
   assert.equal(by.d.status, "disabled")
-  assert.deepEqual(s.kickable.map((a) => a.id), ["p1"])
+  assert.deepEqual(s.idle.map((a) => a.id), ["p1"])
+  // Any account can be kicked, whatever its state.
+  assert.equal(s.kickable.length, s.accounts.length)
+  assert.equal(by.p3.kickable, true); assert.equal(by.x.kickable, true); assert.equal(by.d.kickable, true)
 })
 
 test("a window whose reset passed reads as reset", () => {
@@ -309,5 +312,5 @@ test("in use only while usage keeps rising", () => {
   assert.equal(busy.recentTokens, 5500)
   const quiet = A.accountView(running(0), NOW)
   assert.equal(quiet.usable, true)
-  assert.equal(quiet.kickable, false)
+  assert.equal(quiet.kickable, true)
 })
