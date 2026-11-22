@@ -198,7 +198,7 @@ Column {
             Row {
               required property int index
               // The row stays put across refreshes; only what it shows changes.
-              readonly property var modelData: tierBlock.modelData.windows[index] || ({ short: "", percent: 0 })
+              readonly property var modelData: tierBlock.modelData.windows[index] || ({ short: "", percent: 0, pace: -1 })
               spacing: Style.space(4)
               Text {
                 text: modelData.short
@@ -212,6 +212,7 @@ Column {
                 width: Style.space(40)
                 thickness: Style.space(3)
                 value: modelData.percent
+                pace: isFinite(modelData.pace) ? modelData.pace : -1
                 graded: true
                 foreground: pool.foreground
                 anchors.verticalCenter: parent.verticalCenter

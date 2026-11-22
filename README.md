@@ -151,7 +151,10 @@ average.
 **Accounts.** Accounts group into tiers by CPAMC `priority` — the highest
 tier serves while any of it has room, lower tiers are overflow and fold into
 a one-line summary until clicked. Each row shows the account, a mini meter
-per window with its reset, and its state as glyph and word: `● in use`
+per window with its reset and that account's own pace tick (where its use
+would sit if spread evenly over the time its window has run; the hover
+tooltip says "on pace" or how far ahead or under), and its state as glyph
+and word: `● in use`
 (it served tokens within `inUseMinutes`, default 3), `○ idle` (no recent use;
 accent-colored when its window hasn't started, so a kick would start it), `■ full · 1h 10m`, `▲ sign in →` (its login died; click to
 sign in again), `– disabled`. A folded tier still says "▲ 2 to sign in".
@@ -309,9 +312,22 @@ every queue:
 | Other agents (Fireworks billing) | `refreshIntervalSec` (5 min), and on open if older than a minute | `refreshIntervalSec` |
 
 Local passes never touch the network: they reuse the last account limits
-and only reread session files whose size or mtime changed. Codex's per-file
-token cache lives in SQLite under `~/.cache/omarchy/agent-usage/`; its
-session index uses the same change detection. `bin/claude-session-enricher`
+and only reread session files whose size or mtime changed.
+
+**Collector overlay.** Claude, Codex and Local run Omarchy's own packaged
+collectors through `bin/collector-overlay`, which loads each one as a Python
+module and wraps a few of its functions instead of rewriting its source, so
+an Omarchy update that moves code around no longer breaks the panel. Each
+extension is applied on its own; one whose target is gone is skipped with a
+warning on stderr, and if the extended run fails the plain packaged collector
+runs, so the panel always gets a record. The extensions: `--local-only`, a
+3-second scan reuse, the Claude probe backoff, Codex's full history (not just
+30 days) in its own rollout cache with per-day `dailyUsage` buckets, the
+Codex renewal date, and rollouts sent through CPAMC counted as Codex's
+(OpenAI models on a provider whose base URL is CPAMC's port), which the Local
+collector then leaves out so they count once.
+
+Codex's session index uses the same change detection. `bin/claude-session-enricher`
 adds Claude's full per-day, per-model history and the session index from the
 same transcripts, caching each file's parsed messages by size and mtime in
 `~/.cache/omarchy/agent-usage/claude-session-index-v1.json`. Session titles
@@ -320,8 +336,9 @@ subagent transcripts count toward their parent session.
 
 Anthropic's usage endpoint rate-limits hard — roughly one answer every two
 minutes, with 429s (carrying `Retry-After: 0`) for the rest — so Claude's
-cadence is paced to that budget and `bin/claude-limits.pyfrag` backs off
-after a refusal (1, 2, 4, then 5 minutes), never probing inside the backoff.
+cadence is paced to that budget and `bin/collector-overlay` backs off
+after a refusal (1, 2, 4, then 5 minutes, or longer when a `Retry-After`
+asks for it), never probing inside the backoff.
 A probe under 15 seconds old is reused. The last good limits stay on screen
 marked with their age. Agents without a record yet are found by a discovery
 pass every `refreshIntervalSec`. A full forced scan remains available through
@@ -331,7 +348,9 @@ Adding an agent therefore never touches this plugin: ship a collector that
 prints the record contract (see the `claude` and `codex` collectors in
 `bin/`), and the panel gains a tab. An `assets/<id>.svg` mark is optional —
 with an `assets/<id>-light.svg` twin if the mark needs a dark variant for
-light surfaces — and the bar glyph stands in when there is none.
+light surfaces. Agents this plugin ships no mark for use Omarchy's own (in
+`/usr/share/omarchy/shell/plugins/agents/assets/`), and the bar glyph stands
+in when neither has one.
 
 | Collector | Limits | Local stats |
 |---|---|---|

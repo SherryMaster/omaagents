@@ -6,7 +6,7 @@ const NAMES = ["pricing", "bucketCost", "periodRange", "daysInRange", "sumUsage"
   "chartBuckets", "modelRows", "sessionRows", "formatTokens", "formatMoney",
   "limitWindows", "paceFor", "limitDetail", "formatDuration", "planLine", "limitsFreshness",
   "resolvePeriod", "providerPriced", "monthGrid", "monthPreset",
-  "poolSummary", "poolLimits", "poolDetail", "poolPlanLine", "accountView"]
+  "poolSummary", "poolLimits", "poolDetail", "poolPlanLine", "accountView", "paceWords"]
 
 export function loadAnalytics() {
   const source = readFileSync(new URL("../Analytics.js", import.meta.url), "utf8")

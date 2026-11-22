@@ -1,0 +1,464 @@
+#!/usr/bin/python3
+"""Run Omarchy's packaged Claude or Codex collector with OmaAgents' extensions.
+
+Usage: collector-overlay <claude|codex|local> [--force] [--limits-only] [--local-only]
+
+The packaged collector is loaded as a module and a few of its functions are
+swapped for wrapped ones; its own main() then runs as usual. This replaces the
+old approach of rewriting the collector's source text, which broke on every
+Omarchy release that moved a line. Every extension is applied on its own: one
+whose target is gone is skipped with a warning, and if the extended run fails
+the plain packaged collector runs instead, so the panel always gets a record.
+
+Extensions, both agents:
+  --local-only   never contact the provider: limits come from the last good
+                 answer, so the panel can rescan local usage every few seconds
+  scan reuse     3 s instead of 20 s, so fast passes see new turns quickly
+  limitsFetchedAtMs, limitsNote, limitsRetryAtMs on the record
+
+Claude: back off after a refused limits check (60, 120, 240, 300 s) and never
+probe inside the backoff, not even for --force.
+
+Codex: the full rollout history (not just 30 days) in a cache of its own,
+per-day per-model token buckets (`dailyUsage`), the subscription's renewal
+date (`subscriptionEndsAt`), and rollouts sent through CPAMC counted as Codex:
+upstream files any loopback base_url under its Local collector.
+
+Local: the same CPAMC-routed Codex turns are left out, so they count once.
+"""
+
+from __future__ import annotations
+
+import base64
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+import time
+import tomllib
+from datetime import datetime, timezone
+from pathlib import Path
+
+PACKAGED = "/usr/share/omarchy/bin/omarchy-agent-usage-{}"
+CLAUDE_BACKOFF_SECONDS = (60, 120, 240, 300)
+SCAN_REUSE_SECONDS = 3
+CODEX_HISTORY_DAYS = 36500
+HOME = Path.home()
+
+
+def warn(message):
+  print(f"omaagents overlay: {message}", file=sys.stderr)
+
+
+def load(agent, name):
+  os.environ.setdefault("OMARCHY_PATH", "/usr/share/omarchy")
+  path = PACKAGED.format(agent)
+  loader = importlib.machinery.SourceFileLoader(name, path)
+  spec = importlib.util.spec_from_loader(name, loader)
+  module = importlib.util.module_from_spec(spec)
+  sys.modules[name] = module
+  loader.exec_module(module)
+  return module
+
+
+def apply(label, patch):
+  try:
+    patch()
+    return True
+  except Exception as exc:
+    warn(f"{label} not applied ({type(exc).__name__}: {exc}); packaged behaviour kept")
+    return False
+
+
+def previous_record(agent):
+  path = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / f"omarchy/agents/usage/{agent}.json"
+  try:
+    data = json.loads(path.read_text())
+    return data if isinstance(data, dict) else {}
+  except (OSError, ValueError):
+    return {}
+
+
+def num(value):
+  try:
+    n = float(value or 0)
+    return int(n) if n == n else 0
+  except (TypeError, ValueError):
+    return 0
+
+
+# ------------------------------------------------------------------ common
+
+
+def patch_common(mod, collectors, agent, extra):
+  """Faster scan reuse, and the record fields the panel reads, filled in
+  just before the packaged emit() prints the record."""
+
+  def reuse():
+    collectors.SCAN_REUSE_SECONDS = SCAN_REUSE_SECONDS
+    if hasattr(mod, "SCAN_REUSE_SECONDS"):
+      mod.SCAN_REUSE_SECONDS = SCAN_REUSE_SECONDS
+  apply("scan reuse window", reuse)
+
+  real_emit = mod.emit
+
+  def emit(record, *args, **kwargs):
+    try:
+      if "limitsFetchedAt" in record and not record.get("limitsFetchedAtMs"):
+        record["limitsFetchedAtMs"] = num(record.get("limitsFetchedAt"))
+      extra(record)
+    except Exception as exc:
+      warn(f"record extras skipped ({type(exc).__name__}: {exc})")
+    return real_emit(record, *args, **kwargs)
+  mod.emit = emit
+
+
+# ------------------------------------------------------------------ claude
+
+
+def patch_claude(mod, collectors, local_only):
+  meta = {}
+  real_probe = mod.probe_limits
+  real_collect = mod.collect_limits
+
+  def backoff_path(cache_name):
+    return collectors.cache_root() / ("omaagents-" + cache_name.replace(".json", "") + "-backoff.json")
+
+  def seed(cache_name):
+    # Omarchy 4.5 keys the kept limits by account; the single file kept
+    # before it has the same shape, so its numbers carry over once.
+    target = collectors.cache_root() / cache_name
+    legacy = collectors.cache_root() / "claude-limits.json"
+    if target == legacy or target.exists():
+      return
+    kept = collectors.read_json(legacy)
+    if isinstance(kept.get("limits"), list) and kept["limits"] and num(kept.get("fetchedAtMs")) > 0:
+      collectors.write_json(target, {"fetchedAtMs": num(kept["fetchedAtMs"]), "limits": kept["limits"]})
+
+  def collect_limits(access_token, expires_at_ms, refresh_expires_at_ms, force, cache_name="claude-limits.json"):
+    try:
+      seed(cache_name)
+    except Exception as exc:
+      warn(f"could not carry over the kept limits ({exc})")
+    path = backoff_path(cache_name)
+    state = collectors.read_json(path)
+    now = time.time()
+    retry_at = num(state.get("retryAtMs")) / 1000
+    note = str(state.get("note") or "")
+    skip = local_only or now < retry_at
+    probed = {}
+
+    def probe(token):
+      if skip:
+        # Read as a refusal the packaged code already handles: the kept
+        # numbers stand, current while younger than its 15-minute guard.
+        text = "" if local_only else f"Claude limits check paused after a refusal ({note or 'check failed'})."
+        return {"ok": False, "rateLimited": True, "helpText": text}
+      result = real_probe(token)
+      probed.update(result)
+      return result
+
+    mod.probe_limits = probe
+    try:
+      result = real_collect(access_token, expires_at_ms, refresh_expires_at_ms, force, cache_name)
+    finally:
+      mod.probe_limits = real_probe
+
+    if probed:
+      if probed.get("ok"):
+        state = {}
+      elif probed.get("transport"):
+        # Nobody answered, so there is nobody to pester; the shell retries
+        # sooner on retryAdvised instead.
+        state = {"count": num(state.get("count")), "note": "offline", "retryAtMs": 0}
+      else:
+        count = num(state.get("count")) + 1
+        # 429s carry "Retry-After: 0", which is no advice: the header can
+        # only lengthen the schedule.
+        match = re.search(r"retry after (\d+)", str(probed.get("helpText") or ""))
+        delay = max(int(match.group(1)) if match else 0, CLAUDE_BACKOFF_SECONDS[min(count, len(CLAUDE_BACKOFF_SECONDS)) - 1])
+        state = {"count": count, "note": "rate-limited" if probed.get("rateLimited") else "check failed",
+                 "retryAtMs": round((now + delay) * 1000)}
+      try:
+        if state:
+          collectors.write_json(path, state)
+        elif path.exists():
+          path.unlink()
+      except OSError as exc:
+        warn(f"could not keep the probe backoff ({exc})")
+    meta[cache_name] = state
+    meta["last"] = state
+    return result
+
+  mod.collect_limits = collect_limits
+
+  def extra(record):
+    state = meta.get("last") or {}
+    if state.get("note"):
+      record["limitsNote"] = state["note"]
+    if num(state.get("retryAtMs")) > time.time() * 1000:
+      record["limitsRetryAtMs"] = num(state["retryAtMs"])
+
+  return extra
+
+
+# ------------------------------------------------------------------- codex
+
+
+def cpamc_port():
+  for candidate in (os.environ.get("CPAMC_CONFIG"), HOME / ".config/cliproxyapi/config.yaml",
+                    HOME / ".cli-proxy-api/config.yaml"):
+    if candidate and Path(candidate).expanduser().is_file():
+      text = Path(candidate).expanduser().read_text(errors="replace")
+      server = text.split("server:", 1)[1] if "server:" in text else text
+      match = re.search(r"^\s*port:\s*[\"']?(\d+)", server, re.M)
+      return match.group(1) if match else "8317"
+  return "8317"
+
+
+def cpamc_providers():
+  """Codex provider ids whose base_url is CPAMC on this machine."""
+  local = re.compile(rf"//(127\.0\.0\.1|localhost|\[::1\]):{re.escape(cpamc_port())}(/|$)")
+  home = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
+  try:
+    config = tomllib.loads((home / "config.toml").read_text())
+  except (OSError, ValueError):
+    return set()
+  providers = config.get("model_providers") or {}
+  return {str(name).lower() for name, entry in providers.items()
+          if isinstance(entry, dict) and local.search(str(entry.get("base_url") or ""))}
+
+
+def subscription_ends_at(collectors, fetch=False):
+  """When the signed-in ChatGPT plan renews or ends, from the account's live
+  entitlement (the ID token's billing claims lag renewals), cached per
+  account. "" when unknown."""
+  import urllib.request
+  auth_path = Path(os.environ.get("CODEX_HOME") or HOME / ".codex") / "auth.json"
+  try:
+    tokens = json.loads(auth_path.read_text()).get("tokens") or {}
+    account_id = tokens.get("account_id") or ""
+  except (OSError, ValueError, TypeError, AttributeError):
+    return ""
+  cache_path = collectors.cache_root() / "codex-subscription-v1.json"
+  cached = collectors.read_json(cache_path)
+  if cached.get("accountId") != account_id:
+    cached = {}
+
+  def future_date(value):
+    try:
+      date = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+      if date.tzinfo is None:
+        return ""
+      return date.astimezone(timezone.utc).isoformat() if date.timestamp() > time.time() else ""
+    except (ValueError, TypeError):
+      return ""
+
+  if fetch and tokens.get("access_token") and account_id:
+    try:
+      request = urllib.request.Request(
+        "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+        headers={"Authorization": "Bearer " + tokens["access_token"],
+                 "ChatGPT-Account-Id": account_id,
+                 "User-Agent": "codex_cli_rs/0.171.0"},
+      )
+      with urllib.request.urlopen(request, timeout=8) as response:
+        accounts = json.load(response).get("accounts") or {}
+      account = accounts.get(account_id)
+      if not isinstance(account, dict):
+        # Never silently substitute another account's subscription.
+        raise ValueError("selected account not returned")
+      entitlement = account.get("entitlement") or {}
+      subscription = account.get("last_active_subscription") or {}
+      value = ""
+      if entitlement.get("has_active_subscription"):
+        if subscription.get("will_renew"):
+          value = entitlement.get("renews_at") or entitlement.get("expires_at")
+        else:
+          value = entitlement.get("expires_at") or entitlement.get("renews_at")
+      cached = {"accountId": account_id, "subscriptionEndsAt": future_date(value),
+                "checkedAt": datetime.now(timezone.utc).isoformat()}
+      collectors.write_json(cache_path, cached)
+      return cached["subscriptionEndsAt"]
+    except Exception:
+      # Offline keeps a still-valid date; never advance it by arithmetic.
+      pass
+  value = future_date(cached.get("subscriptionEndsAt"))
+  if value or cached:
+    return value
+  try:
+    payload = tokens.get("id_token", "").split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    namespace = claims.get("https://api.openai.com/auth") or {}
+    return future_date(namespace.get("chatgpt_subscription_active_until")
+                       or claims.get("https://api.openai.com/auth.chatgpt_subscription_active_until"))
+  except Exception:
+    return ""
+
+
+def patch_codex(mod, collectors, local_only):
+  def history():
+    # Its own rollout cache: the packaged collectors trim theirs to 30 days,
+    # and sharing one file would make the two evict each other's records.
+    collectors.CODEX_WINDOW_DAYS = CODEX_HISTORY_DAYS
+    digest = __import__("hashlib").sha1(str(collectors.codex_home()).encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    path = collectors.cache_root() / f"omaagents-codex-rollouts-{digest}.json"
+    collectors.codex_rollout_cache = lambda agent_id=None: path
+    mod.codex_rollout_cache = collectors.codex_rollout_cache
+  apply("full Codex history", history)
+
+  def scan_cache():
+    real = mod.cached_scan
+    # A scan with dailyUsage in it: never one the packaged collector cached.
+    mod.cached_scan = lambda agent_id, *args, **kwargs: real("omaagents-" + agent_id, *args, **kwargs)
+  apply("separate scan cache", scan_cache)
+
+  def daily():
+    base = mod.Stats
+
+    class DailyStats(base):
+      def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.daily = {}
+
+      def add(self, day, session, model, input_tokens, output_tokens, cache_read, cache_write, prompts=1):
+        super().add(day, session, model, input_tokens, output_tokens, cache_read, cache_write, prompts)
+        total = input_tokens + output_tokens + cache_read + cache_write
+        if day is None or total <= 0:
+          return
+        entry = self.daily.setdefault(day, {"date": day, "messageCount": 0, "modelUsage": {}})
+        entry["messageCount"] += total
+        bucket = entry["modelUsage"].setdefault(model, collectors.empty_bucket())
+        bucket["inputTokens"] += input_tokens
+        bucket["outputTokens"] += output_tokens
+        bucket["cacheReadInputTokens"] += cache_read
+        bucket["cacheCreationInputTokens"] += cache_write
+
+      def snapshot(self):
+        snap = super().snapshot()
+        snap["dailyUsage"] = [self.daily[day] for day in sorted(self.daily)]
+        return snap
+
+    mod.Stats = DailyStats
+    mod.STATS = DailyStats()
+  apply("daily token buckets", daily)
+
+  def routed():
+    real = mod.scan_native_codex_sessions
+    cpamc = cpamc_providers()
+    if not cpamc:
+      return
+
+    def scan_native_codex_sessions(reuse):
+      complete = real(reuse)
+      # The packaged scan counts the built-in provider only. Rollouts on a
+      # provider pointed at CPAMC were served by the pooled ChatGPT accounts,
+      # so their OpenAI models are Codex's too.
+      records, all_read = collectors.codex_rollouts(collectors.codex_rollout_cache(), reuse=reuse, native=True)
+      for record in records.values():
+        if str(record.get("provider") or "").lower() not in cpamc:
+          continue
+        for day, models in record["days"].items():
+          for model, (input_tokens, output_tokens, cache_read, cache_write, prompts) in models.items():
+            if not collectors.codex_openai_model(model):
+              continue
+            name = mod.model_name(model)
+            if input_tokens or output_tokens or cache_read or cache_write:
+              mod.STATS.add(day, record["session"], name, input_tokens, output_tokens, cache_read, cache_write, prompts=0)
+            if prompts:
+              mod.STATS.add_prompts(day, record["session"], prompts)
+      return complete and all_read
+    mod.scan_native_codex_sessions = scan_native_codex_sessions
+  apply("CPAMC-routed rollouts", routed)
+
+  if local_only:
+    def local_limits():
+      real = mod.collect_limits
+      previous = previous_record("codex")
+
+      def collect_limits(home=None, force=False, primary=True):
+        cache = mod.limits_cache(home, primary)
+        base = {
+          "usageStatusText": str(previous.get("usageStatusText") or ""),
+          "authHelpText": str(previous.get("authHelpText") or ""),
+          "live": previous.get("limitsStale") is not True,
+        }
+        if cache and (cache.limits or cache.fetched_at > 0):
+          limits, _ = cache.kept()
+          result = {**base, "limits": limits, "fetchedAtMs": cache.fetched_at,
+                    "tierLabel": str(cache.data.get("tierLabel") or previous.get("tierLabel") or "")}
+          if isinstance(cache.data.get("resetCredits"), dict):
+            result["resetCredits"] = cache.data["resetCredits"]
+          return result
+        if previous:
+          return {**base, "limits": previous.get("limits") or [], "tierLabel": str(previous.get("tierLabel") or ""),
+                  "fetchedAtMs": num(previous.get("limitsFetchedAtMs") or previous.get("limitsFetchedAt"))}
+        return real(home, force, primary)
+      mod.collect_limits = collect_limits
+    apply("--local-only limits", local_limits)
+
+  def extra(record):
+    record["subscriptionEndsAt"] = subscription_ends_at(collectors, fetch=not local_only)
+
+  return extra
+
+
+# ------------------------------------------------------------------- local
+
+
+def patch_local(mod, collectors, local_only):
+  def routed():
+    real = mod.codex_route_owner
+    cpamc = cpamc_providers()
+
+    def codex_route_owner(provider, model, urls):
+      if str(provider or "").lower() in cpamc and collectors.codex_openai_model(model):
+        return "codex"
+      return real(provider, model, urls)
+    mod.codex_route_owner = codex_route_owner
+    real_scan = mod.cached_scan
+    mod.cached_scan = lambda agent_id, *args, **kwargs: real_scan("omaagents-" + agent_id, *args, **kwargs)
+  apply("CPAMC-routed rollouts left to Codex", routed)
+  return lambda record: None
+
+
+# -------------------------------------------------------------------- main
+
+
+def run(agent, args):
+  local_only = "--local-only" in args
+  sys.argv = [PACKAGED.format(agent)] + [a for a in args if a != "--local-only"]
+  try:
+    mod = load(agent, f"omarchy_usage_{agent}")
+    collectors = sys.modules["collectors"]
+    if agent == "local":
+      patch_local(mod, collectors, local_only)
+    else:
+      extra = (patch_claude if agent == "claude" else patch_codex)(mod, collectors, local_only)
+      patch_common(mod, collectors, agent, extra)
+  except Exception as exc:
+    warn(f"extensions unavailable ({type(exc).__name__}: {exc}); running the packaged collector")
+    return plain(agent)
+  try:
+    result = mod.main()
+    return result if isinstance(result, int) else 0
+  except SystemExit:
+    raise
+  except Exception as exc:
+    warn(f"extended run failed ({type(exc).__name__}: {exc}); running the packaged collector")
+    return plain(agent)
+
+
+def plain(agent):
+  mod = load(agent, f"omarchy_usage_{agent}_plain")
+  result = mod.main()
+  return result if isinstance(result, int) else 0
+
+
+if __name__ == "__main__":
+  if len(sys.argv) < 2 or sys.argv[1] not in ("claude", "codex", "local"):
+    print(__doc__.strip().splitlines()[2], file=sys.stderr)
+    sys.exit(2)
+  sys.exit(run(sys.argv[1], sys.argv[2:]))

@@ -4,7 +4,7 @@ import qs.Ui
 import "../Analytics.js" as A
 
 // One pooled account: who, which plan, what state, and a mini meter per
-// window. Every account carries a checkbox for a kick (on an idle one it
+// window with that account's own pace tick. Every account carries a checkbox for a kick (on an idle one it
 // starts the clock); clicking the row toggles it. Clicking an account whose login died signs it
 // in again. Status never rides on color alone — every state has its glyph
 // and word.
@@ -60,8 +60,10 @@ Item {
     if (signedIn) lines.push("Codex's own sign-in (plugins and apps use it)")
     for (var i = 0; i < a.windows.length; i++) {
       var w = a.windows[i]
+      var paceText = w.started ? A.paceWords(w.percent, w.pace) : ""
       lines.push(w.short + ": " + Math.round(w.percent * 100) + "% used"
-        + (w.started ? " · resets in " + A.formatDuration(w.resetMs) : " · not started"))
+        + (w.started ? " · resets in " + A.formatDuration(w.resetMs) : " · not started")
+        + (paceText !== "" ? " · " + paceText : ""))
     }
     if (a.status === "running") lines.push("In use — " + (a.recentTokens > 0
       ? A.formatTokens(a.recentTokens) + " tokens in the last " + A.formatDuration(row.inUseMs)
@@ -185,7 +187,7 @@ Item {
         Row {
           required property int index
           // The row stays put across refreshes; only what it shows changes.
-          readonly property var modelData: row.windows[index] || ({ short: "", percent: 0, started: false, resetMs: -1 })
+          readonly property var modelData: row.windows[index] || ({ short: "", percent: 0, started: false, resetMs: -1, pace: -1 })
           spacing: Style.space(5)
           width: (parent.width - Style.space(12) * Math.max(0, (row.account.windows.length - 1))) / Math.max(1, row.account.windows.length)
 
@@ -203,6 +205,9 @@ Item {
             width: Math.max(Style.space(24), parent.width - shortLabel.width - pct.width - resetText.width - Style.space(15))
             thickness: Style.space(3)
             value: modelData.started ? modelData.percent : 0
+            // This account's own pace: where its use would sit if spread
+            // evenly over the time its window has run.
+            pace: modelData.started && isFinite(modelData.pace) ? modelData.pace : -1
             graded: true
             foreground: row.foreground
             anchors.verticalCenter: parent.verticalCenter

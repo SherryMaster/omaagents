@@ -546,11 +546,17 @@ function limitDetail(w, nowMs) {
   var remaining = resetMs(w, nowMs)
   if (!(remaining > 0)) return ""
   var text = "Resets in " + formatDuration(remaining)
-  var pace = paceFor(w, nowMs)
-  if (pace < 0) return text
-  var delta = Math.round((w.percent - pace) * 100)
-  if (Math.abs(delta) < 3) return text + " · on pace"
-  return text + " · " + Math.abs(delta) + "% " + (delta > 0 ? "ahead of pace" : "under pace")
+  var words = paceWords(w.percent, paceFor(w, nowMs))
+  return words === "" ? text : text + " · " + words
+}
+
+// Where use sits against an even spread over the window: "on pace" within
+// 3 points, else how far ahead or under. "" when there is no pace to compare.
+function paceWords(percent, pace) {
+  if (!isFinite(pace) || pace < 0 || !isFinite(percent) || percent < 0) return ""
+  var delta = Math.round((percent - pace) * 100)
+  if (Math.abs(delta) < 3) return "on pace"
+  return Math.abs(delta) + "% " + (delta > 0 ? "ahead of pace" : "under pace")
 }
 
 // "Updated 40s ago" under the limits, plus why and until when once the
@@ -793,11 +799,8 @@ function poolDetail(w, nowMs) {
   else parts.push(p.open + "/" + p.total + " open")
   if (p.freeAt > nowMs) parts.push("frees up in " + formatDuration(p.freeAt - nowMs))
   else if (p.nextResetAt > nowMs) parts.push("next reset " + formatDuration(p.nextResetAt - nowMs))
-  var pace = isFinite(w.pace) ? w.pace : -1
-  if (pace >= 0) {
-    var delta = Math.round((w.percent - pace) * 100)
-    parts.push(Math.abs(delta) < 3 ? "on pace" : Math.abs(delta) + "% " + (delta > 0 ? "ahead of pace" : "under pace"))
-  }
+  var words = paceWords(w.percent, isFinite(w.pace) ? w.pace : -1)
+  if (words !== "") parts.push(words)
   return parts.join(" · ")
 }
 

@@ -314,3 +314,23 @@ test("in use only while usage keeps rising", () => {
   assert.equal(quiet.usable, true)
   assert.equal(quiet.kickable, true)
 })
+
+test("paceWords reads use against an even spread", () => {
+  assert.equal(A.paceWords(0.5, 0.49), "on pace")
+  assert.equal(A.paceWords(0.7, 0.5), "20% ahead of pace")
+  assert.equal(A.paceWords(0.1, 0.4), "30% under pace")
+  assert.equal(A.paceWords(0.5, -1), "")
+  assert.equal(A.paceWords(0.5, NaN), "")
+})
+
+test("every account carries its own pace per window", () => {
+  const s = A.poolSummary(POOL, NOW)
+  const by = Object.fromEntries(s.accounts.map((a) => [a.id, a]))
+  // p2: 5h window half gone, half used; weekly half gone, 40% used.
+  close(by.p2.windows[0].pace, 0.5)
+  close(by.p2.windows[1].pace, 0.5)
+  assert.equal(A.paceWords(by.p2.windows[0].percent, by.p2.windows[0].pace), "on pace")
+  assert.equal(A.paceWords(by.p2.windows[1].percent, by.p2.windows[1].pace), "10% under pace")
+  // An idle window has not started its clock, so no pace is drawn.
+  assert.equal(by.p1.windows[0].started, false)
+})
