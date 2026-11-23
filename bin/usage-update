@@ -28,9 +28,14 @@ if ! $fast && (( ${#only[@]} == 0 )); then
   python3 "$PLUGIN_DIR/update-pricing" >/dev/null 2>&1 &
 fi
 
+# With CPAMC set up, only the agents it holds accounts for are collected: the
+# panel lists CPAMC's providers and nothing else.
+held=" $("$PLUGIN_DIR/account-pool" --held 2>/dev/null || echo '*') "
+
 wanted() {
   local agent="$1"
   [[ -n ${excluded[$agent]} ]] && return 1
+  [[ $held == " * " || $held == *" $agent "* ]] || return 1
   (( ${#only[@]} == 0 )) && return 0
   local candidate
   for candidate in "${only[@]}"; do

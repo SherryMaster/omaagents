@@ -698,15 +698,9 @@ var IN_USE_MS = 3 * 60000
 // running: served tokens within the last inUseMs. limited: a window is full.
 function accountView(a, nowMs, inUseMs) {
   var windows = ((a && a.windows) || []).map(function(w) { return liveWindow(w, nowMs) })
-  var direct = a.source === "direct"
   var view = { id: String(a.id || a.email || ""), email: String(a.email || ""), plan: String(a.plan || ""),
     planLabel: planLabel(a.plan), priority: num(a.priority), windows: windows, note: String(a.note || ""),
-    stale: a.stale === true, freeInMs: -1,
-    // A direct account is the agent's own sign-in: CPAMC can't kick it or
-    // sign it in again. `alsoDirect` names the agent that uses a CPAMC
-    // account by itself as well.
-    direct: direct, via: String(a.via || ""), alsoDirect: direct ? "" : String(a.direct || ""),
-    kickable: !direct,
+    stale: a.stale === true, freeInMs: -1, kickable: true,
     lastActiveMs: num(a.lastActiveMs), quietMs: num(a.lastActiveMs) > 0 ? nowMs - num(a.lastActiveMs) : -1,
     recentTokens: 0 }
   var span = inUseMs > 0 ? inUseMs : IN_USE_MS
@@ -717,7 +711,6 @@ function accountView(a, nowMs, inUseMs) {
   var full = windows.filter(function(w) { return w.percent >= 1 && w.resetMs > 0 })
   if (a.status === "disabled") view.status = "disabled"
   else if (a.status === "expired") view.status = "expired"
-  else if (a.status === "paused") view.status = "paused"
   else if (a.status === "unknown" || windows.length === 0 && a.status !== "limited") view.status = "unknown"
   else if (groupsFull(windows) || a.status === "limited"
            && (windows.length === 0 || windows.some(function(w) { return w.started }))) {
@@ -734,10 +727,7 @@ function accountView(a, nowMs, inUseMs) {
 }
 
 function poolSummary(pool, nowMs, inUseMs) {
-  var all = ((pool && pool.accounts) || []).map(function(a) { return accountView(a, nowMs, inUseMs) })
-  // Direct sign-ins are listed apart: they aren't CPAMC's to route or kick.
-  var direct = all.filter(function(x) { return x.direct })
-  var accounts = all.filter(function(x) { return !x.direct })
+  var accounts = ((pool && pool.accounts) || []).map(function(a) { return accountView(a, nowMs, inUseMs) })
   accounts.sort(function(x, y) {
     return y.priority - x.priority || planRank(x.plan) - planRank(y.plan)
       || (x.email < y.email ? -1 : x.email > y.email ? 1 : 0)
@@ -761,7 +751,7 @@ function poolSummary(pool, nowMs, inUseMs) {
   var active = accounts.filter(function(x) { return x.status !== "disabled" })
   return {
     routed: !!(pool && pool.routed), endpoint: String(pool && pool.endpoint || ""),
-    accounts: accounts, tiers: tiers, direct: direct,
+    accounts: accounts, tiers: tiers,
     // One account to work with: the panel drops the pool vocabulary and
     // reads like any single account that happens to go through CPAMC.
     single: active.length === 1, only: active.length === 1 ? active[0] : null,

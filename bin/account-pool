@@ -8,16 +8,14 @@ already stores) and attached to the record as `pool`. The panel then shows
 the pool instead of the single signed-in account whenever the agent is
 actually routed through CPAMC.
 
-Accounts an agent uses on its own, outside CPAMC (Claude Code's or Codex's
-own sign-in, agy's keyring login, an OpenCode Go key), join the pool as
-`source: "direct"` with the limits the agent's own collector already read, so
-every account in use shows its windows. A direct login CPAMC also holds is
-marked on the CPAMC account (`direct`) instead of being listed twice.
+Only CPAMC's accounts are listed: an agent's own sign-in outside CPAMC is
+not part of the pool and never shows.
 
 Tokens are only ever read. This never refreshes, rewrites or copies a CPAMC
 credential: refresh tokens rotate, and a second writer breaks them.
 
 Usage: account-pool <codex|claude|agy|opencode> [--force] [--local-only]   (record on stdin)
+       account-pool --held   (the agents CPAMC holds accounts for, or "*" without CPAMC)
 Any failure passes the record through untouched.
 """
 
@@ -49,12 +47,10 @@ RESET_MATCH_SECONDS = 300
 MIN_AGE_SECONDS = {"codex": 30, "claude": 150, "agy": 120, "opencode": 60}
 # What CPAMC calls each agent's accounts in its auth files.
 CPAMC_TYPES = {"codex": "codex", "claude": "claude", "agy": "antigravity", "opencode": "opencode"}
-# How each agent's own sign-in is named on a direct account.
-DIRECT_VIA = {"codex": "Codex", "claude": "Claude Code", "agy": "agy", "opencode": "OpenCode"}
 CLOUD_CODE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:"
 OPENCODE_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 OPENCODE_CONSOLE_USAGE_URL = "https://opencode.ai/inference/go/v1/usage"
-PACKAGED = "/usr/share/omarchy/bin/omarchy-agent-usage-{}"
+
 BACKOFF_SECONDS = (60, 120, 240, 300)
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -664,88 +660,6 @@ def shared_limits(provider, record):
           "stale": record.get("limitsStale") is True, "note": str(record.get("limitsNote") or "")}
 
 
-# ------------------------------------------------------------- direct use
-
-def packaged(agent):
-  """Omarchy's own collector for the agent, loaded as a module (read-only use)."""
-  import importlib.machinery
-  import importlib.util
-  os.environ.setdefault("OMARCHY_PATH", "/usr/share/omarchy")
-  loader = importlib.machinery.SourceFileLoader(f"omaagents_{agent}_packaged", PACKAGED.format(agent))
-  spec = importlib.util.spec_from_loader(loader.name, loader)
-  module = importlib.util.module_from_spec(spec)
-  loader.exec_module(module)
-  return module
-
-
-def direct_logins(provider, record, cpamc_tokens):
-  """The accounts this agent signs in with by itself: [{email, label}], the
-  first being the one its own collector read the limits of."""
-  if provider in ("claude", "codex"):
-    email = str(record.get("accountLabel") or "")
-    return [{"email": email, "label": email}] if email else []
-  try:
-    module = packaged(provider)
-  except Exception as error:
-    print(f"account-pool: can't load the packaged {provider} collector: {error}", file=sys.stderr)
-    return []
-  if provider == "agy":
-    found, now = [], time.time()
-    # The order the collector asks them in: fresh tokens, latest expiry first.
-    for entry in sorted(module.logins(), key=lambda e: (not module.token_fresh(e, now), -e["expiresAt"])):
-      email = str(entry.get("email") or "")
-      if entry.get("accessToken") in cpamc_tokens:
-        continue
-      key = email or entry.get("source")
-      if key and key not in [f["email"] or f["label"] for f in found]:
-        found.append({"email": email, "label": email or f"{entry.get('source')} sign-in"})
-    return found
-  if provider == "opencode":
-    keys = [c for c in module.credential_candidates() if c.token not in cpamc_tokens]
-    return [{"email": "", "label": "OpenCode Go key"}] if keys else []
-  return []
-
-
-def direct_status(record, windows):
-  text = str(record.get("usageStatusText") or "").lower()
-  if "expired" in text or "waiting for auth" in text or "refused" in text:
-    return "expired"
-  if "paused" in text:
-    return "paused"
-  if not windows:
-    return "unknown"
-  return "limited" if groups_full(windows) else "ok"
-
-
-def direct_accounts(provider, record, cpamc_accounts, cache):
-  """Direct accounts to list, after marking the CPAMC ones they duplicate."""
-  via = DIRECT_VIA.get(provider, provider)
-  tokens = {a["_token"] for a in cpamc_accounts if a["_token"]}
-  emails = {a["email"].lower(): a for a in cpamc_accounts}
-  out = []
-  for index, login in enumerate(direct_logins(provider, record, tokens)):
-    twin = emails.get(login["email"].lower()) if login["email"] else None
-    if twin is not None:
-      twin["direct"] = via
-      continue
-    windows = record_windows(provider, record) if index == 0 else []
-    account_id = f"direct-{provider}-{login['email'] or login['label']}"
-    previous = cache.get(account_id) or {}
-    entry = {"id": account_id, "email": login["label"], "plan": str(record.get("tierLabel") or "").lower(),
-             "priority": 0, "disabled": False, "source": "direct", "via": via, "windows": windows,
-             "fetchedAtMs": int(record.get("limitsFetchedAtMs") or record.get("limitsFetchedAt") or 0),
-             "status": direct_status(record, windows) if index == 0 else "unknown",
-             "lastActiveMs": last_active_ms(previous, windows), "recentTokens": []}
-    note = str(record.get("authHelpText") or record.get("limitsNote") or "") if index == 0 else \
-      f"{via} signs in with this account too; only the first sign-in's limits are read."
-    if note:
-      entry["note"] = note
-    if index == 0 and record.get("limitsStale") is True:
-      entry["stale"] = True
-    out.append(entry)
-  return out
-
-
 # ------------------------------------------------------------------ main
 
 def build_pool(provider, force, local_only, record=None):
@@ -753,6 +667,8 @@ def build_pool(provider, force, local_only, record=None):
   if not config or not config["authDir"].is_dir():
     return None
   accounts = load_accounts(config["authDir"], CPAMC_TYPES[provider])
+  if not accounts:
+    return None
 
   CACHE_DIR.mkdir(parents=True, exist_ok=True)
   cache_path = CACHE_DIR / f"pool-{provider}-v1.json"
@@ -761,11 +677,6 @@ def build_pool(provider, force, local_only, record=None):
     cache = json.loads(cache_path.read_text())
   except (OSError, ValueError):
     cache = {}
-  direct = direct_accounts(provider, record or {}, accounts, cache)
-  # Nothing in CPAMC and one sign-in of its own: the limits above already
-  # are that account, an account list would only repeat them.
-  if not accounts and len(direct) <= 1:
-    return None
   if marker.exists():
     # Something changed an account on purpose (a kick): look again now.
     force = True
@@ -791,11 +702,8 @@ def build_pool(provider, force, local_only, record=None):
       states = pool.map(lambda a: probe(provider, a, cache.get(a["id"]) or {}, own(a)), due)
       for account, state in zip(due, states):
         cache[account["id"]] = state
-  # A direct account keeps only what its activity needs from pass to pass.
-  remembered = {a["id"]: {"windows": a["windows"], "lastActiveMs": a["lastActiveMs"]} for a in direct}
-  if due or any(cache.get(k) != v for k, v in remembered.items()):
-    cache.update(remembered)
-    known = {a["id"] for a in accounts} | set(remembered)
+  if due:
+    known = {a["id"] for a in accounts}
     tmp = cache_path.with_suffix(".tmp")
     tmp.write_text(json.dumps({k: v for k, v in cache.items() if k in known}))
     tmp.replace(cache_path)
@@ -808,7 +716,6 @@ def build_pool(provider, force, local_only, record=None):
     state = cache.get(account["id"]) or {}
     used = activity.get(account["id"]) or {}
     entry = {k: v for k, v in account.items() if not k.startswith("_")}
-    entry["source"] = "cpamc"
     entry["plan"] = state.get("plan") or account["plan"]
     entry["windows"] = state.get("windows") or []
     entry["fetchedAtMs"] = int(state.get("fetchedAtMs") or 0)
@@ -831,19 +738,33 @@ def build_pool(provider, force, local_only, record=None):
       if state.get("stale"):
         entry["stale"] = True
     out.append(entry)
-  out.extend(direct)
 
   return {
     "source": "cpamc",
     "endpoint": f"127.0.0.1:{config['port']}",
-    "routed": is_routed and bool(accounts),
+    "routed": is_routed,
     "fetchedAtMs": max([a["fetchedAtMs"] for a in out] + [0]),
     "accounts": out,
   }
 
 
+def held_agents():
+  """The agents CPAMC holds accounts for (disabled ones too: they are still
+  CPAMC's), or None without CPAMC."""
+  config = cpamc()
+  if not config or not config["authDir"].is_dir():
+    return None
+  return [agent for agent, kind in CPAMC_TYPES.items() if load_accounts(config["authDir"], kind)]
+
+
 def main():
   args = sys.argv[1:]
+  if args[:1] == ["--held"]:
+    # For usage-update: which agents to collect at all. "*" = no CPAMC here,
+    # so every agent counts.
+    held = held_agents()
+    print("*" if held is None else " ".join(held))
+    return
   provider = args[0] if args and not args[0].startswith("-") else ""
   raw = sys.stdin.read()
   try:

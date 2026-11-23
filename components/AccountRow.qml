@@ -6,11 +6,10 @@ import "../Analytics.js" as A
 // One account: who, which plan, what state, and — unless folded — one line
 // per limit window, each with a full-width meter carrying that account's own
 // pace tick. The chevron folds it to its header line (which then names the
-// fullest window). A CPAMC account carries a checkbox for a kick (on an idle
-// one it starts the clock); clicking the row toggles it. Clicking an account
-// whose login died signs it in again. A direct account (an agent's own
-// sign-in, outside CPAMC) only shows its limits. Status never rides on color
-// alone — every state has its glyph and word.
+// fullest window). An account carries a checkbox for a kick (on an idle one
+// it starts the clock); clicking the row toggles it. Clicking an account whose
+// login died signs it in again. Status never rides on color alone — every
+// state has its glyph and word.
 Item {
   id: row
   property var account: null
@@ -36,15 +35,10 @@ Item {
 
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property bool kickable: !!account && account.kickable
-  readonly property bool needsSignIn: !!account && account.status === "expired" && canSignIn && !account.direct
+  readonly property bool needsSignIn: !!account && account.status === "expired" && canSignIn
   readonly property var windows: account && account.windows ? account.windows : []
   readonly property bool hasGroups: windows.some(function(w) { return w.group !== "" })
-  readonly property string name: showEmail || account && account.direct && account.email.indexOf("@") < 0
-    ? String(account ? account.email : "") : "Account " + ordinal
-  // Which agent uses it on its own: this direct account's, or the one that
-  // also signs in with this CPAMC account.
-  readonly property string tag: !account ? "" : account.direct ? account.via.toUpperCase()
-    : account.alsoDirect !== "" ? "+ " + account.alsoDirect.toUpperCase() : ""
+  readonly property string name: showEmail ? String(account ? account.email : "") : "Account " + ordinal
   // The fullest started window, for the folded header.
   readonly property var peak: {
     var best = null
@@ -65,10 +59,9 @@ Item {
     case "running": return { glyph: "●", text: "in use", color: "#9ece6a" }
     case "limited": return { glyph: "■", text: a.freeInMs > 0 ? "full · " + A.formatDuration(a.freeInMs) : "full", color: "#ff9e64" }
     case "expired": return { glyph: "▲", text: row.needsSignIn ? "sign in →" : "sign in again", color: Color.urgent }
-    case "paused": return { glyph: "‖", text: "paused", color: "#e0af68" }
     case "disabled": return { glyph: "–", text: "disabled", color: row.dim }
     case "ok": return { glyph: "○", text: "ok", color: row.dim }
-    default: return a.direct ? { glyph: "–", text: "no limits", color: row.dim } : { glyph: "…", text: "checking", color: row.dim }
+    default: return { glyph: "…", text: "checking", color: row.dim }
     }
   }
 
@@ -76,8 +69,6 @@ Item {
     var a = account
     if (!a) return ""
     var lines = [a.email + " · " + a.planLabel + (a.priority ? " · priority " + a.priority : "")]
-    if (a.direct) lines.push("Used directly by " + a.via + ", outside CPAMC")
-    else if (a.alsoDirect !== "") lines.push(a.alsoDirect + " also signs in with this account by itself, outside CPAMC")
     for (var i = 0; i < a.windows.length; i++) {
       var w = a.windows[i]
       var paceText = w.started ? A.paceWords(w.percent, w.pace) : ""
@@ -174,25 +165,12 @@ Item {
       }
       Text {
         id: planText
-        anchors.right: signedInText.left
+        anchors.right: peakText.left
         anchors.rightMargin: Style.space(8)
         anchors.verticalCenter: parent.verticalCenter
         visible: row.showPlan
         text: row.account && row.showPlan ? row.account.planLabel.toUpperCase() : ""
         color: row.dim
-        font.family: row.fontFamily
-        font.pixelSize: Style.font.caption
-        font.letterSpacing: 1
-      }
-      Text {
-        id: signedInText
-        visible: row.tag !== ""
-        anchors.right: peakText.left
-        anchors.rightMargin: visible ? Style.space(8) : 0
-        anchors.verticalCenter: parent.verticalCenter
-        // Empty rather than just hidden, so it takes no room when absent.
-        text: row.tag
-        color: "#7aa2f7"
         font.family: row.fontFamily
         font.pixelSize: Style.font.caption
         font.letterSpacing: 1

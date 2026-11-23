@@ -144,20 +144,19 @@ account is only full when every group has a spent window. OpenCode Go
 accounts show the rolling 5-hour, weekly and monthly meters from
 `opencode.ai/zen/go/v1/usage`.
 
-**Direct sign-ins.** An account an agent uses by itself, outside CPAMC —
-Claude Code's or Codex's own login, `agy`'s keyring sign-in, an OpenCode Go
-key — joins the list under **DIRECT** with the limits the agent's own
-collector read (no extra request), tagged with the agent that uses it. A
-direct login CPAMC also holds is not listed twice: the CPAMC row gets a
-"+ AGY"-style tag instead. Direct accounts can't be kicked or signed in from
-the panel.
+**CPAMC only.** With CPAMC set up, the panel lists CPAMC and nothing else:
+only the agents it holds accounts for get a tab (`account-pool --held`
+names them, and `usage-update` runs only their collectors), and only its
+accounts are listed — an agent's own sign-in outside CPAMC never shows, and
+its limits never stand in for the pool's. Without CPAMC every agent shows as
+usual.
 
-**Routed**, the pool replaces the signed-in account everywhere: the bar's
+The pool replaces the signed-in account everywhere: the bar's
 `session | weekly` figures, the header ("7 accounts via CPAMC", "POOL · 3
 PLUS + 4 FREE") and the limit meters are the serving tier's averages
 ("3 Plus pooled"), with "2/3 have room · frees up in 1h 10m · on pace" under
-each. **Not routed**, the accounts still list, flagged "not routed", and the
-meters stay the signed-in account's.
+each. **Not routed**, the accounts are flagged "not routed" — the agent
+doesn't draw from them right now.
 
 **One account.** With a single account to work with (disabled ones don't
 count), the pool vocabulary goes away: the header shows that account's email
@@ -179,8 +178,7 @@ of more than four starts folded. Past ~330 px the account list scrolls in
 its own box. States show as glyph and word: `● in use`
 (it served tokens within `inUseMinutes`, default 3), `○ idle` (no recent use;
 accent-colored when its window hasn't started, so a kick would start it), `■ full · 1h 10m`, `▲ sign in →` (its login died; click to
-sign in again), `‖ paused` (a direct sign-in whose token lapsed until its
-agent runs again), `– disabled`. A folded tier still says "▲ 2 to sign in".
+sign in again), `– disabled`. A folded tier still says "▲ 2 to sign in".
 
 Use is literal tokens. Codex logs every turn's tokens together with the
 serving account's rate limits, and each account's reset instants are unique,

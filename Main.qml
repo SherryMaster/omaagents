@@ -215,26 +215,36 @@ Item {
 
   // An agent earns a place in the bar and the panel by being switched on in
   // settings and having actually produced numbers — locally or on a synced
-  // device. With nothing to show, the whole module collapses out of the bar
-  // rather than sitting there dimmed.
+  // device. With CPAMC set up, only the agents it holds accounts for get one:
+  // the panel lists CPAMC's providers and nothing else. With nothing to show,
+  // the whole module collapses out of the bar rather than sitting there dimmed.
+  function cpamcHolds(record) {
+    return !!record && !!record.pool && record.pool.source === "cpamc"
+      && Array.isArray(record.pool.accounts) && record.pool.accounts.length > 0
+  }
+
   property var enabledProviders: {
     var rev = dataRevision
     var syncRev = syncRevision
     var result = []
     var localIds = {}
+    var cpamcOnly = false
+    for (var c = 0; c < agents.length; c++)
+      if (cpamcHolds(agents[c] ? agents[c].record : null)) cpamcOnly = true
     for (var i = 0; i < agents.length; i++) {
       var record = agents[i] ? agents[i].record : null
       if (!record || !record.id) continue
       var id = String(record.id)
       localIds[id] = true
       if (!providerEnabled(id)) continue
+      if (cpamcOnly && !cpamcHolds(record)) continue
       var display = displayProvider(record)
       if (providerHasData(display)) result.push(display)
     }
     // An agent that only ever ran on another machine has no local record, but
     // its synced numbers still deserve a tab. Rate limits stay blank — they
     // are per-account and never travel.
-    var syncedProviders = syncConfigured() && aggregateData && aggregateData.providers ? aggregateData.providers : {}
+    var syncedProviders = !cpamcOnly && syncConfigured() && aggregateData && aggregateData.providers ? aggregateData.providers : {}
     for (var syncedId in syncedProviders) {
       if (localIds[syncedId] || !providerEnabled(syncedId)) continue
       var stats = syncedProviders[syncedId] || {}
@@ -278,10 +288,10 @@ Item {
     var stats = syncedStatsFor(String(record.id))
     var synced = !!stats
     var deviceCount = synced ? Number(stats.deviceCount || aggregateData.deviceCount || 0) : 0
-    // Routed through CPAMC, the agent spends a whole pool of accounts, so the
-    // pool's numbers replace the signed-in account's everywhere.
+    // When CPAMC holds the agent's accounts, the pool's numbers replace the
+    // agent's own sign-in everywhere — routed or not, only CPAMC is shown.
     var pool = record.pool && Array.isArray(record.pool.accounts) && record.pool.accounts.length ? record.pool : null
-    var pooled = !!pool && pool.routed === true
+    var pooled = !!pool
     var poolStale = pooled && pool.accounts.every(function(a) { return a.stale === true || a.status === "disabled" })
 
     return {

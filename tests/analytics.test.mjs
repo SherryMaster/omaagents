@@ -355,18 +355,12 @@ test("pooled grouped windows keep their groups apart", () => {
   close(limits[1].percent, 0.2)
 })
 
-test("direct sign-ins are listed apart and never kicked", () => {
+test("every CPAMC account is listed and kickable", () => {
   const s = A.poolSummary({ routed: true, accounts: [
-    { id: "c", email: "c@x", plan: "pro", priority: 0, status: "ok", source: "cpamc", direct: "agy",
-      windows: [win(18000, 0.1, 2)] },
-    { id: "d", email: "d@x", plan: "pro", priority: 0, status: "paused", source: "direct", via: "Claude Code",
-      windows: [win(604800, 0.2, 50)] },
+    { id: "c", email: "c@x", plan: "pro", priority: 0, status: "ok", windows: [win(18000, 0.1, 2)] },
+    { id: "e", email: "e@x", plan: "pro", priority: 0, status: "expired", windows: [] },
   ] }, NOW)
-  assert.deepEqual(s.accounts.map((a) => a.id), ["c"])
-  assert.deepEqual(s.direct.map((a) => a.id), ["d"])
-  assert.equal(s.single, true)
-  assert.equal(s.accounts[0].alsoDirect, "agy")
-  assert.equal(s.direct[0].status, "paused")
-  assert.equal(s.direct[0].kickable, false)
-  assert.deepEqual(s.kickable.map((a) => a.id), ["c"])
+  assert.deepEqual(s.accounts.map((a) => a.id), ["c", "e"])
+  assert.deepEqual(s.kickable.map((a) => a.id), ["c", "e"])
+  assert.equal(s.direct, undefined)
 })
