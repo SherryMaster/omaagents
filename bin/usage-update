@@ -67,6 +67,9 @@ for collector in /usr/share/omarchy/bin/omarchy-agent-usage-*; do
   elif [[ $agent == claude ]]; then
     collector="$PLUGIN_DIR/claude-collector"
     if $fast; then agent_flags+=(--local-only); fi
+  elif [[ $agent == agy || $agent == opencode ]]; then
+    collector="$PLUGIN_DIR/pooled-collector"
+    agent_flags=("$agent" "${agent_flags[@]}")
   elif [[ $agent == local ]]; then
     collector="$PLUGIN_DIR/collector-overlay"
     agent_flags=(local "${agent_flags[@]}")

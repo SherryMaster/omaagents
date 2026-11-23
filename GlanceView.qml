@@ -28,12 +28,14 @@ Column {
   property var loginRunner: null
   property var kickSelection: ({})
   property var expandedTiers: ({})
+  property var collapsedAccounts: ({})
   signal providerPicked(int index)
   signal detailsRequested()
   signal accountToggled(string id)
   signal kickRequested()
   signal kickSelectionCleared()
   signal tierToggled(int priority, bool expanded)
+  signal accountCollapseToggled(string id, bool collapsed)
 
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property var limits: A.limitWindows(provider)
@@ -229,7 +231,7 @@ Column {
     expandedTiers: glance.expandedTiers
     showEmail: glance.showAccount
     inUseMs: glance.inUseMs
-    signedInEmail: glance.provider ? String(glance.provider.accountLabel || "") : ""
+    collapsedAccounts: glance.collapsedAccounts
     agentName: glance.provider ? glance.provider.providerName : ""
     foreground: glance.foreground
     fontFamily: glance.fontFamily
@@ -237,6 +239,7 @@ Column {
     onKickRequested: glance.kickRequested()
     onSelectionCleared: glance.kickSelectionCleared()
     onTierToggled: function(priority, expanded) { glance.tierToggled(priority, expanded) }
+    onAccountCollapseToggled: function(id, collapsed) { glance.accountCollapseToggled(id, collapsed) }
   }
 
   // ---------- The period's figures

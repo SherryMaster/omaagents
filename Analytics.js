@@ -626,7 +626,7 @@ function monthPreset(kind, todayIso) {
 // everything while any of it has room, lower tiers are overflow. A pooled
 // window is the tier's average, since the tier's capacity is the sum.
 
-var PLAN_RANK = { max: 0, pro: 1, plus: 2, team: 3, business: 4, enterprise: 5, free: 9 }
+var PLAN_RANK = { ultra: 0, max: 0, pro: 1, plus: 2, go: 2, team: 3, business: 4, enterprise: 5, starter: 8, free: 9 }
 
 // "max 20x" ranks as max.
 function planRank(plan) {
@@ -651,16 +651,43 @@ function poolWindowShort(lengthSec) {
   return Math.round(lengthSec / 86400) + "d"
 }
 
+// A window's name on its own line: "5h", "Weekly", "Monthly", prefixed by
+// the group of models it gates when an account has several ("Gemini 5h").
+function windowName(lengthSec, group) {
+  if (group) return group + " " + poolWindowShort(lengthSec)
+  return lengthSec <= 6 * 3600 ? Math.max(1, Math.round(lengthSec / 3600)) + "h"
+    : lengthSec <= 8 * 86400 ? "Weekly" : lengthSec <= 31 * 86400 ? "Monthly" : Math.round(lengthSec / 86400) + "-day"
+}
+
+// Windows of one group gate the same models: the account is full only when
+// every group has a spent window (Antigravity's Gemini allowance outlives a
+// spent Claude/GPT one).
+function groupsFull(windows) {
+  var groups = {}, any = false
+  for (var i = 0; i < windows.length; i++) {
+    var g = windows[i].group || ""
+    if (groups[g] === undefined) groups[g] = false
+    if (windows[i].percent >= 1 && windows[i].resetMs > 0) groups[g] = true
+    any = true
+  }
+  if (!any) return false
+  for (var key in groups) if (!groups[key]) return false
+  return true
+}
+
 // A window whose reset passed since the fetch has reset: nothing used, not
 // started, whatever the stale numbers say.
 function liveWindow(w, nowMs) {
   var length = num(w && w.lengthSec)
+  var group = String(w && w.group || "")
   var at = new Date(String(w && w.resetsAt || "")).getTime()
   var left = isFinite(at) ? at - nowMs : -1
-  if (left <= 0) return { lengthSec: length, short: poolWindowShort(length), percent: 0, started: false, resetMs: -1 }
+  var base = { lengthSec: length, group: group, name: windowName(length, group),
+    short: (group ? group.split("/")[0] + " " : "") + poolWindowShort(length) }
+  if (left <= 0) return Object.assign(base, { percent: 0, started: false, resetMs: -1, pace: -1 })
   var percent = Math.max(0, num(w.percent))
-  return { lengthSec: length, short: poolWindowShort(length), percent: percent, started: w.started === true,
-    resetMs: left, pace: w.started === true && length > 0 ? Math.max(0, Math.min(1, 1 - left / (length * 1000))) : 0 }
+  return Object.assign(base, { percent: percent, started: w.started === true, resetMs: left,
+    pace: w.started === true && length > 0 ? Math.max(0, Math.min(1, 1 - left / (length * 1000))) : 0 })
 }
 
 var IN_USE_MS = 3 * 60000
@@ -671,9 +698,15 @@ var IN_USE_MS = 3 * 60000
 // running: served tokens within the last inUseMs. limited: a window is full.
 function accountView(a, nowMs, inUseMs) {
   var windows = ((a && a.windows) || []).map(function(w) { return liveWindow(w, nowMs) })
+  var direct = a.source === "direct"
   var view = { id: String(a.id || a.email || ""), email: String(a.email || ""), plan: String(a.plan || ""),
     planLabel: planLabel(a.plan), priority: num(a.priority), windows: windows, note: String(a.note || ""),
-    stale: a.stale === true, freeInMs: -1, kickable: true,
+    stale: a.stale === true, freeInMs: -1,
+    // A direct account is the agent's own sign-in: CPAMC can't kick it or
+    // sign it in again. `alsoDirect` names the agent that uses a CPAMC
+    // account by itself as well.
+    direct: direct, via: String(a.via || ""), alsoDirect: direct ? "" : String(a.direct || ""),
+    kickable: !direct,
     lastActiveMs: num(a.lastActiveMs), quietMs: num(a.lastActiveMs) > 0 ? nowMs - num(a.lastActiveMs) : -1,
     recentTokens: 0 }
   var span = inUseMs > 0 ? inUseMs : IN_USE_MS
@@ -684,8 +717,9 @@ function accountView(a, nowMs, inUseMs) {
   var full = windows.filter(function(w) { return w.percent >= 1 && w.resetMs > 0 })
   if (a.status === "disabled") view.status = "disabled"
   else if (a.status === "expired") view.status = "expired"
+  else if (a.status === "paused") view.status = "paused"
   else if (a.status === "unknown" || windows.length === 0 && a.status !== "limited") view.status = "unknown"
-  else if (full.length > 0 || a.status === "limited"
+  else if (groupsFull(windows) || a.status === "limited"
            && (windows.length === 0 || windows.some(function(w) { return w.started }))) {
     view.status = "limited"
     view.freeInMs = full.length ? Math.max.apply(null, full.map(function(w) { return w.resetMs })) : -1
@@ -700,7 +734,10 @@ function accountView(a, nowMs, inUseMs) {
 }
 
 function poolSummary(pool, nowMs, inUseMs) {
-  var accounts = ((pool && pool.accounts) || []).map(function(a) { return accountView(a, nowMs, inUseMs) })
+  var all = ((pool && pool.accounts) || []).map(function(a) { return accountView(a, nowMs, inUseMs) })
+  // Direct sign-ins are listed apart: they aren't CPAMC's to route or kick.
+  var direct = all.filter(function(x) { return x.direct })
+  var accounts = all.filter(function(x) { return !x.direct })
   accounts.sort(function(x, y) {
     return y.priority - x.priority || planRank(x.plan) - planRank(y.plan)
       || (x.email < y.email ? -1 : x.email > y.email ? 1 : 0)
@@ -724,7 +761,7 @@ function poolSummary(pool, nowMs, inUseMs) {
   var active = accounts.filter(function(x) { return x.status !== "disabled" })
   return {
     routed: !!(pool && pool.routed), endpoint: String(pool && pool.endpoint || ""),
-    accounts: accounts, tiers: tiers,
+    accounts: accounts, tiers: tiers, direct: direct,
     // One account to work with: the panel drops the pool vocabulary and
     // reads like any single account that happens to go through CPAMC.
     single: active.length === 1, only: active.length === 1 ? active[0] : null,
@@ -738,17 +775,22 @@ function poolSummary(pool, nowMs, inUseMs) {
 // The tier's windows grouped by length: average use and pace over the
 // accounts that have it, and the soonest moment any of it frees up.
 function poolWindows(accounts) {
-  var byLength = {}, order = []
+  var byKey = {}, order = []
   for (var i = 0; i < accounts.length; i++) {
     for (var j = 0; j < accounts[i].windows.length; j++) {
       var w = accounts[i].windows[j]
-      if (!byLength[w.lengthSec]) { byLength[w.lengthSec] = []; order.push(w.lengthSec) }
-      byLength[w.lengthSec].push({ w: w, account: accounts[i] })
+      var key = (w.group || "") + "|" + w.lengthSec
+      if (!byKey[key]) { byKey[key] = []; order.push({ key: key, group: w.group || "", length: w.lengthSec, first: order.length }) }
+      byKey[key].push({ w: w, account: accounts[i] })
     }
   }
-  order.sort(function(x, y) { return x - y })
-  return order.map(function(length) {
-    var list = byLength[length], used = 0, pace = 0, next = -1, freeing = -1
+  // Groups in the order they first appear, shortest window first in each.
+  var groupOrder = []
+  order.forEach(function(o) { if (groupOrder.indexOf(o.group) < 0) groupOrder.push(o.group) })
+  order.sort(function(x, y) { return groupOrder.indexOf(x.group) - groupOrder.indexOf(y.group) || x.length - y.length })
+  return order.map(function(o) {
+    var length = o.length, group = o.group
+    var list = byKey[o.key], used = 0, pace = 0, next = -1, freeing = -1
     for (var k = 0; k < list.length; k++) {
       var w = list[k].w
       used += Math.min(1, w.percent)
@@ -756,7 +798,9 @@ function poolWindows(accounts) {
       if (w.started && w.resetMs > 0 && (next < 0 || w.resetMs < next)) next = w.resetMs
       if (w.percent >= 1 && w.resetMs > 0 && (freeing < 0 || w.resetMs < freeing)) freeing = w.resetMs
     }
-    return { lengthSec: length, title: poolWindowTitle(length), short: poolWindowShort(length),
+    return { lengthSec: length, group: group,
+      title: (group ? group + " " : "") + poolWindowTitle(length),
+      short: (group ? group.split("/")[0] + " " : "") + poolWindowShort(length),
       percent: list.length ? used / list.length : 0, pace: list.length ? pace / list.length : -1,
       accounts: list.length, full: list.filter(function(x) { return x.w.percent >= 1 }).length,
       nextResetMs: next, freeInMs: freeing }
@@ -775,9 +819,10 @@ function poolLimits(pool, nowMs) {
     var one = tier.counted[0] || summary.only
     if (!one) return []
     return one.windows.map(function(w) {
-      var label = w.lengthSec <= 6 * 3600 ? w.short + " window" : w.lengthSec <= 8 * 86400 ? "Weekly (7-day)"
-        : "Monthly (" + Math.round(w.lengthSec / 86400) + "-day)"
-      return { label: label, title: poolWindowTitle(w.lengthSec), percent: Math.min(1, w.percent),
+      var prefix = w.group ? w.group + " " : ""
+      var label = prefix + (w.lengthSec <= 6 * 3600 ? poolWindowShort(w.lengthSec) + " window" : w.lengthSec <= 8 * 86400 ? "Weekly (7-day)"
+        : "Monthly (" + Math.round(w.lengthSec / 86400) + "-day)")
+      return { label: label, title: prefix + poolWindowTitle(w.lengthSec), percent: Math.min(1, w.percent),
         resetsAt: w.started && w.resetMs > 0 ? new Date(nowMs + w.resetMs).toISOString() : "" }
     })
   }

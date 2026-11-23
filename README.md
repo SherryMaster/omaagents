@@ -121,7 +121,8 @@ its own the first time a scan finds usage. Drop it with
 
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (CPAMC) can hold
 many accounts per provider and spread an agent's traffic across them. When
-it holds accounts for Codex or Claude, `bin/account-pool` reads each one's
+it holds accounts for Codex, Claude, Antigravity (`agy`) or OpenCode Go,
+`bin/account-pool` reads each one's
 own limits — in parallel, read-only, with the access token CPAMC already
 stores — and attaches them to the agent's record as `pool`. It never
 refreshes or rewrites a credential: refresh tokens rotate, and a second
@@ -132,6 +133,24 @@ or `~/.cli-proxy-api/config.yaml` (its `auth-dir` and port). The agent counts
 as **routed** when its own config sends traffic to that port on localhost —
 Codex's `model_provider` base URL in `~/.codex/config.toml`, Claude's
 `ANTHROPIC_BASE_URL` in the environment or `~/.claude/settings.json`.
+Antigravity and OpenCode accounts serve whatever is pointed at CPAMC, so a
+live account of theirs always counts as routed.
+
+Antigravity accounts are read the way `agy` reads its own: Google's Cloud
+Code `loadCodeAssist` (plan), `fetchAvailableModels` (the shared Gemini
+allowance) and `retrieveUserQuotaSummary` (the Claude/GPT group's 5-hour and
+weekly buckets). Their windows carry a `group` ("Gemini", "Claude/GPT"); an
+account is only full when every group has a spent window. OpenCode Go
+accounts show the rolling 5-hour, weekly and monthly meters from
+`opencode.ai/zen/go/v1/usage`.
+
+**Direct sign-ins.** An account an agent uses by itself, outside CPAMC —
+Claude Code's or Codex's own login, `agy`'s keyring sign-in, an OpenCode Go
+key — joins the list under **DIRECT** with the limits the agent's own
+collector read (no extra request), tagged with the agent that uses it. A
+direct login CPAMC also holds is not listed twice: the CPAMC row gets a
+"+ AGY"-style tag instead. Direct accounts can't be kicked or signed in from
+the panel.
 
 **Routed**, the pool replaces the signed-in account everywhere: the bar's
 `session | weekly` figures, the header ("7 accounts via CPAMC", "POOL · 3
@@ -150,14 +169,18 @@ average.
 
 **Accounts.** Accounts group into tiers by CPAMC `priority` — the highest
 tier serves while any of it has room, lower tiers are overflow and fold into
-a one-line summary until clicked. Each row shows the account, a mini meter
-per window with its reset and that account's own pace tick (where its use
-would sit if spread evenly over the time its window has run; the hover
-tooltip says "on pace" or how far ahead or under), and its state as glyph
-and word: `● in use`
+a one-line summary until clicked. Each account shows its name, plan and
+state, then one line per window: its name, a full-width meter with that
+account's own pace tick (where its use would sit if spread evenly over the
+time its window has run; the hover tooltip says "on pace" or how far ahead
+or under), how much is used and when it resets. The chevron folds an account
+to its header line, which then names its fullest window ("wk 47%"); a group
+of more than four starts folded. Past ~330 px the account list scrolls in
+its own box. States show as glyph and word: `● in use`
 (it served tokens within `inUseMinutes`, default 3), `○ idle` (no recent use;
 accent-colored when its window hasn't started, so a kick would start it), `■ full · 1h 10m`, `▲ sign in →` (its login died; click to
-sign in again), `– disabled`. A folded tier still says "▲ 2 to sign in".
+sign in again), `‖ paused` (a direct sign-in whose token lapsed until its
+agent runs again), `– disabled`. A folded tier still says "▲ 2 to sign in".
 
 Use is literal tokens. Codex logs every turn's tokens together with the
 serving account's rate limits, and each account's reset instants are unique,

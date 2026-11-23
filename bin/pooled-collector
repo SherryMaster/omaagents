@@ -1,0 +1,11 @@
+#!/bin/bash
+set -o pipefail
+
+# Omarchy's own collector for an agent CPAMC can also hold accounts for
+# (agy = Antigravity, opencode = OpenCode Go), followed by account-pool,
+# which adds every CPAMC account and every direct sign-in with its limits.
+# Usage: pooled-collector <agy|opencode> [--force] [--limits-only]
+dir="${BASH_SOURCE[0]%/*}"
+agent="$1"
+shift
+"/usr/share/omarchy/bin/omarchy-agent-usage-$agent" "$@" | "$dir/account-pool" "$agent" "$@"

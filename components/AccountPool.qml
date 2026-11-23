@@ -1,11 +1,15 @@
 import QtQuick
+import QtQuick.Controls
 import qs.Commons
 import qs.Ui
 import "../Analytics.js" as A
 
-// Every account CPAMC holds for the agent, grouped into routing tiers. The
-// first tier (the one serving requests) is open; overflow tiers fold into a
-// one-line summary until asked for. One action bar kicks either the selected
+// Every account CPAMC holds for the agent, grouped into routing tiers, then
+// the agent's direct sign-ins (accounts it uses by itself, outside CPAMC).
+// The first tier (the one serving requests) is open; overflow tiers fold into
+// a one-line summary until asked for. Each account folds to one line too
+// (folded by default once a group holds more than four), and a long list
+// scrolls inside its own box. One action bar kicks either the selected CPAMC
 // accounts or every live one, whatever their state, and says why when it can't.
 Column {
   id: pool
@@ -17,9 +21,11 @@ Column {
   property string agentId: ""           // codex | claude: what CPAMC calls these accounts
   property var selection: ({})          // account id -> true
   property var expandedTiers: ({})      // priority -> bool
+  property var collapsedAccounts: ({})  // account id -> bool
+  // Past this height the account list scrolls in place.
+  property real maxListHeight: Style.space(330)
   property bool showEmail: true
   property real inUseMs: 180000
-  property string signedInEmail: ""
   property string agentName: ""
   property color foreground: Color.foreground
   property string fontFamily: Style.font.family
@@ -27,9 +33,12 @@ Column {
   signal kickRequested()
   signal selectionCleared()
   signal tierToggled(int priority, bool expanded)
+  signal accountCollapseToggled(string id, bool collapsed)
 
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property var tiers: summary ? summary.tiers : []
+  readonly property var directAccounts: summary ? summary.direct : []
+  readonly property bool hasCpamc: !!summary && summary.accounts.length > 0
   readonly property bool single: !!summary && summary.single
   // Any account can be selected, whatever its state.
   readonly property int selectedCount: {
@@ -42,6 +51,11 @@ Column {
   readonly property string blockedReason: !canKick ? "Kicking isn't available for " + agentName + " accounts."
     : kicker && kicker.unavailableReason !== "" ? kicker.unavailableReason
     : ""
+
+  function accountCollapsed(account, groupSize) {
+    var value = account ? collapsedAccounts[account.id] : undefined
+    return value === undefined ? groupSize > 4 : value === true
+  }
 
   function tierExpanded(tier, index) {
     var value = expandedTiers[tier.priority]
@@ -63,15 +77,17 @@ Column {
       spacing: Style.space(6)
       PanelSectionHeader {
         id: title
-        text: pool.single ? "ACCOUNT" : "ACCOUNTS"
+        text: pool.single && pool.directAccounts.length === 0 ? "ACCOUNT" : "ACCOUNTS"
         foreground: pool.foreground
         fontFamily: pool.fontFamily
       }
       Text {
         anchors.baseline: title.baseline
-        text: !pool.summary ? "" : (pool.single ? "" : pool.summary.open + "/" + pool.summary.total + " open · ")
+        text: !pool.summary ? "" : !pool.hasCpamc ? pool.directAccounts.length + " direct"
+          : (pool.single ? "" : pool.summary.open + "/" + pool.summary.total + " open · ")
           + (pool.summary.routed ? "CPAMC" : "not routed")
-        color: pool.summary && !pool.summary.routed ? "#e0af68" : pool.dim
+          + (pool.directAccounts.length ? " + " + pool.directAccounts.length + " direct" : "")
+        color: pool.summary && pool.hasCpamc && !pool.summary.routed ? "#e0af68" : pool.dim
         font.family: pool.fontFamily
         font.pixelSize: Style.font.caption
       }
@@ -93,6 +109,7 @@ Column {
       }
       Button {
         id: kickButton
+        visible: pool.hasCpamc && pool.canKick
         readonly property bool usable: pool.blockedReason === "" && !(pool.kicker && pool.kicker.running)
         bordered: true
         iconText: pool.kicker && pool.kicker.running ? "󰑓" : "󱐋"
@@ -117,7 +134,7 @@ Column {
   }
 
   Text {
-    visible: !!pool.summary && !pool.summary.routed
+    visible: pool.hasCpamc && !pool.summary.routed
     width: parent.width
     text: pool.agentName + " isn't routed through CPAMC (" + (pool.summary ? pool.summary.endpoint : "")
       + "), so it doesn't draw from these accounts. The limits above are the signed-in account's."
@@ -126,6 +143,25 @@ Column {
     font.pixelSize: Style.font.caption
     wrapMode: Text.WordWrap
   }
+
+  // ---------- The accounts, scrolling in place once the list grows long
+  Flickable {
+    id: listFlick
+    width: parent.width
+    height: Math.min(list.implicitHeight, pool.maxListHeight)
+    contentWidth: width
+    contentHeight: list.implicitHeight
+    clip: true
+    boundsBehavior: Flickable.StopAtBounds
+    flickableDirection: Flickable.VerticalFlick
+    interactive: contentHeight > height
+    ScrollBar.vertical: ScrollBar { policy: listFlick.interactive ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff }
+
+  Column {
+    id: list
+    // Room for the scrollbar once there is one.
+    width: listFlick.width - (listFlick.interactive ? Style.space(10) : 0)
+    spacing: Style.space(8)
 
   // ---------- Tiers
   Repeater {
@@ -138,7 +174,7 @@ Column {
       readonly property var modelData: pool.tiers[index] || ({ accounts: [], windows: [], plans: [], label: "", open: 0, total: 0, priority: 0 })
       required property int index
       readonly property bool expanded: pool.single || pool.tierExpanded(modelData, index)
-      width: pool.width
+      width: list.width
       spacing: Style.space(2)
 
       // Tier header: label, open count, and — folded — its pooled meters.
@@ -247,18 +283,20 @@ Column {
             required property int index
             // The row stays put across refreshes; only what it shows changes.
             readonly property var modelData: (tierBlock.expanded ? tierBlock.modelData.accounts : [])[index] || null
-            width: pool.width
+            width: list.width
             account: modelData
             nowMs: pool.nowMs
             ordinal: pool.summary.accounts.indexOf(modelData) + 1
             showEmail: pool.showEmail
             showPlan: tierBlock.modelData.plans.length > 1
             inUseMs: pool.inUseMs
-            selectable: !pool.single
-            signedIn: pool.signedInEmail !== "" && modelData.email === pool.signedInEmail
+            selectable: !pool.single && pool.canKick
+            collapsed: pool.accountCollapsed(modelData, tierBlock.modelData.accounts.length)
+            onCollapseToggled: pool.accountCollapseToggled(modelData.id, !collapsed)
             selected: pool.selection[modelData.id] === true
             kicking: !!pool.kicker && pool.kicker.runningIds[modelData.id] === true
-            canSignIn: !!pool.loginRunner && pool.agentId !== ""
+            // cpamc-login signs in Codex and Claude accounts.
+            canSignIn: !!pool.loginRunner && (pool.agentId === "codex" || pool.agentId === "claude")
             signingIn: !!pool.loginRunner && pool.loginRunner.running
               && pool.loginRunner.provider === pool.agentId && pool.loginRunner.email === modelData.email
             foreground: pool.foreground
@@ -273,6 +311,64 @@ Column {
       }
     }
   }
+
+  // ---------- Direct sign-ins: accounts the agent uses by itself
+  Column {
+    visible: pool.directAccounts.length > 0
+    width: list.width
+    spacing: Style.space(2)
+
+    Item {
+      width: parent.width
+      implicitHeight: directLabel.implicitHeight + Style.space(6)
+      Text {
+        id: directLabel
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(21)
+        anchors.verticalCenter: parent.verticalCenter
+        text: "DIRECT  " + pool.directAccounts.length
+        color: "#7aa2f7"
+        font.family: pool.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+        font.letterSpacing: 1
+      }
+      Text {
+        anchors.left: directLabel.right
+        anchors.leftMargin: Style.space(8)
+        anchors.right: parent.right
+        anchors.baseline: directLabel.baseline
+        text: "own sign-in, outside CPAMC"
+        color: pool.dim
+        font.family: pool.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+    }
+
+    Repeater {
+      // Counted, not the array itself: a new array would rebuild every row.
+      model: pool.directAccounts.length
+      AccountRow {
+        required property int index
+        // The row stays put across refreshes; only what it shows changes.
+        readonly property var modelData: pool.directAccounts[index] || null
+        width: list.width
+        account: modelData
+        nowMs: pool.nowMs
+        ordinal: index + 1
+        showEmail: pool.showEmail
+        inUseMs: pool.inUseMs
+        selectable: false
+        collapsed: pool.accountCollapsed(modelData, pool.directAccounts.length)
+        onCollapseToggled: pool.accountCollapseToggled(modelData.id, !collapsed)
+        foreground: pool.foreground
+        fontFamily: pool.fontFamily
+      }
+    }
+  }
+  }  // list
+  }  // listFlick
 
   // ---------- What the last sign-in did
   Text {

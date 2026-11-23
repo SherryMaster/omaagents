@@ -334,3 +334,39 @@ test("every account carries its own pace per window", () => {
   // An idle window has not started its clock, so no pace is drawn.
   assert.equal(by.p1.windows[0].started, false)
 })
+
+test("grouped windows: an account is full only when every group is", () => {
+  const gem = { ...win(18000, 1, 2), group: "Gemini" }
+  const cg5 = { ...win(18000, 0.3, 2), group: "Claude/GPT" }
+  const cgw = { ...win(604800, 0.1, 100), group: "Claude/GPT" }
+  const a = A.accountView({ id: "g", status: "ok", windows: [gem, cg5, cgw] }, NOW)
+  assert.notEqual(a.status, "limited")
+  assert.deepEqual(a.windows.map((w) => w.name), ["Gemini 5h", "Claude/GPT 5h", "Claude/GPT wk"])
+  const spent = A.accountView({ id: "h", status: "ok", windows: [gem, { ...cg5, percent: 1 }, cgw] }, NOW)
+  assert.equal(spent.status, "limited")
+})
+
+test("pooled grouped windows keep their groups apart", () => {
+  const acct = (id, g, c) => ({ id, email: id + "@x", plan: "pro", priority: 0, status: "ok", source: "cpamc",
+    windows: [{ ...win(18000, g, 2), group: "Gemini" }, { ...win(18000, c, 2), group: "Claude/GPT" }] })
+  const limits = A.poolLimits({ routed: true, accounts: [acct("a", 0.2, 0.4), acct("b", 0.4, 0)] }, NOW)
+  assert.deepEqual(limits.map((l) => l.title), ["Gemini Session", "Claude/GPT Session"])
+  close(limits[0].percent, 0.3)
+  close(limits[1].percent, 0.2)
+})
+
+test("direct sign-ins are listed apart and never kicked", () => {
+  const s = A.poolSummary({ routed: true, accounts: [
+    { id: "c", email: "c@x", plan: "pro", priority: 0, status: "ok", source: "cpamc", direct: "agy",
+      windows: [win(18000, 0.1, 2)] },
+    { id: "d", email: "d@x", plan: "pro", priority: 0, status: "paused", source: "direct", via: "Claude Code",
+      windows: [win(604800, 0.2, 50)] },
+  ] }, NOW)
+  assert.deepEqual(s.accounts.map((a) => a.id), ["c"])
+  assert.deepEqual(s.direct.map((a) => a.id), ["d"])
+  assert.equal(s.single, true)
+  assert.equal(s.accounts[0].alsoDirect, "agy")
+  assert.equal(s.direct[0].status, "paused")
+  assert.equal(s.direct[0].kickable, false)
+  assert.deepEqual(s.kickable.map((a) => a.id), ["c"])
+})

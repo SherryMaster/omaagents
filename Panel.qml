@@ -39,6 +39,7 @@ Panel {
   property string expandedSessionId: ""
   property var kickSelection: ({})
   property var expandedTiers: ({})
+  property var collapsedAccounts: ({})
 
   // Countdowns and "today" read this clock, so a panel left open keeps
   // telling the truth, across midnight too.
@@ -398,11 +399,17 @@ Panel {
             loginRunner: loginRunner
             kickSelection: root.kickSelection
             expandedTiers: root.expandedTiers
+            collapsedAccounts: root.collapsedAccounts
             onProviderPicked: function(index) { root.selectProvider(index) }
             onDetailsRequested: root.showDetails()
             onAccountToggled: function(id) { root.toggleKickSelection(id) }
             onKickRequested: root.kickAccounts()
             onKickSelectionCleared: root.kickSelection = ({})
+            onAccountCollapseToggled: function(id, collapsed) {
+              var next = Object.assign({}, root.collapsedAccounts)
+              next[id] = collapsed
+              root.collapsedAccounts = next
+            }
             onTierToggled: function(priority, expanded) {
               var next = Object.assign({}, root.expandedTiers)
               next[priority] = expanded
